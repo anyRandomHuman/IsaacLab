@@ -213,6 +213,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # set number of actors into agent config
     agent_cfg["params"]["config"]["num_actors"] = env.unwrapped.num_envs
+    agent_cfg["params"]["config"]["minibatch_size"] = 36
     # create runner from rl-games
 
     if "pbt" in agent_cfg and agent_cfg["pbt"]["enabled"]:

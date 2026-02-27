@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import MISSING
 
 import isaaclab.sim as sim_utils
+import torch
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObjectCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.managers import EventTermCfg as EventTerm
@@ -28,7 +29,14 @@ import isaaclab_tasks.manager_based.manipulation.inhand.mdp as mdp
 ##
 # Scene definition
 ##
+max_difficulty = 10
+step_size = 0.01
+obj_per_difficulty = 1
 
+asset_names = ['object']
+for i in range(1, max_difficulty, 1):
+    name = f'object_{i}'
+    asset_names.append(name)
 
 @configclass
 class InHandObjectSceneCfg(InteractiveSceneCfg):
@@ -107,6 +115,7 @@ class ObservationsCfg:
 
     @configclass
     class KinematicObsGroupCfg(ObsGroup):
+        concatenate_terms = False
         """Observations with full-kinematic state information.
 
         This does not include acceleration or force information.
@@ -165,8 +174,20 @@ class ObservationsCfg:
             self.object_lin_vel = None
             self.object_ang_vel = None
 
+    @configclass
+    class Test(ObsGroup):
+        concatenate_terms = False
+        # zero = ObsTerm(
+        #     func= lambda env, asset_cfg : torch.zeros_like(env.scene[asset_cfg.name].data.root_pos_w),
+        #     params={"asset_cfg": SceneEntityCfg("object")},
+        # )
+        active_object_pos = ObsTerm(
+            func=mdp.active_pool_wrapper(mdp.root_pos_w, asset_names),
+        )
+
     # observation groups
     policy: KinematicObsGroupCfg = KinematicObsGroupCfg()
+    test = Test()
 
 
 @configclass
@@ -301,6 +322,57 @@ class TerminationsCfg:
     #     func=mdp.object_away_from_goal, params={"threshold": 0.24, "command_name": "object_pose"}
     # )
 
+from isaaclab.managers.curriculum_manager import CurriculumTermCfg as CurrTerm
+@configclass
+class CurriculumCfg:
+    """Curriculum terms for the MDP."""
+    # robot_material = CurrTerm(
+    #     func=mdp.RobotMaterialPropertyADR,
+    #     params={}
+    # )
+
+    # joint_stiffness = CurrTerm(
+    #     func=mdp.RobotJointStiffnessCSADR,
+    # )
+    # damping = CurrTerm(func=mdp.RobotDampingADR)
+    # robot_mass=CurrTerm(func=mdp.RobotMassADR)
+    # robot_friction = CurrTerm(func=mdp.RobotFrictionADR)
+    # amature = CurrTerm(
+    #     func=mdp.RobotArmatureADR,
+    #
+    # )
+    # m = CurrTerm(
+    #     # func=mdp.randomize_rigid_body_material,
+    #     func=mdp.MaterialPropertyADR,
+    #     params={
+    #         "static_friction_range": (0.4, 1.4),
+    #         "dynamic_friction_range": (0.4, 1.4),
+    #         'restitution_range': (0.0, 0.0),
+    #         "num_buckets": 128,
+    #         'asset_cfg': SceneEntityCfg("robot", body_names='^(?!middle_biotac_tip$).*'),
+    #     },
+    # )
+    # m_o = CurrTerm(
+    #     # func=mdp.randomize_rigid_body_material,
+    #     func=mdp.MaterialPropertyADR,
+    #     params={
+    #         "static_friction_range": (0.4, 1.4),
+    #         "dynamic_friction_range": (0.4, 1.4),
+    #         'restitution_range': (0.0, 0.0),
+    #         "num_buckets": 128,
+    #         'asset_cfg': SceneEntityCfg("object"),
+    #     },
+    # )
+
+    object_scale = CurrTerm(
+        func=mdp.AllObjecCSADR,
+        params={
+            "scaled_objects_names": [f'objects_{i}' for i in range(max_difficulty)],
+            'cls': mdp.ObjectScaleAndPosADR,
+            'asset_cfgs': [SceneEntityCfg(name) for name in ['object'] + [f'object_{i}' for i in range(1, max_difficulty)]],
+        }
+    )
+
 
 ##
 # Environment configuration
@@ -333,6 +405,7 @@ class InHandObjectEnvCfg(ManagerBasedRLEnvCfg):
     rewards: RewardsCfg = RewardsCfg()
     terminations: TerminationsCfg = TerminationsCfg()
     events: EventCfg = EventCfg()
+    curriculum = CurriculumCfg()
 
     def __post_init__(self):
         """Post initialization."""
@@ -344,3 +417,43 @@ class InHandObjectEnvCfg(ManagerBasedRLEnvCfg):
         self.sim.render_interval = self.decimation
         # change viewer settings
         self.viewer.eye = (2.0, 2.0, 2.0)
+
+        for i in range(1, max_difficulty, 1):
+            # for j in range(obj_per_difficulty):
+            name = asset_names[i]
+            scale = tuple(torch.rand(3) * i * step_size + 1.0)
+            object: RigidObjectCfg = RigidObjectCfg(
+                prim_path=f"{{ENV_REGEX_NS}}/{name}",
+                spawn=sim_utils.UsdFileCfg(
+                    usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/Blocks/DexCube/dex_cube_instanceable.usd",
+                    rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                        kinematic_enabled=False,
+                        disable_gravity=False,
+                        enable_gyroscopic_forces=True,
+                        solver_position_iteration_count=8,
+                        solver_velocity_iteration_count=0,
+                        sleep_threshold=0.005,
+                        stabilization_threshold=0.0025,
+                        max_depenetration_velocity=1000.0,
+                    ),
+                    mass_props=sim_utils.MassPropertiesCfg(density=400.0),
+                    scale=scale,
+                ),
+                init_state=RigidObjectCfg.InitialStateCfg(pos=(0.0, -0.19, 0.56), rot=(1.0, 0.0, 0.0, 0.0)),
+            )
+            setattr(self.scene, name, object)
+
+        self.observations.policy.active_object_pos = ObsTerm(
+            func=mdp.get_active_object_pos,
+            params={
+                'asset_names': asset_names,
+            }
+        )
+
+        # self.observations.test.active_object_pos_state_less = ObsTerm(
+        #     func=mdp.get_active_object_pos,
+        #     params={
+        #         'asset_names': asset_names,
+        #     }
+        # )
+

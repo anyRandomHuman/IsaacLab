@@ -53,13 +53,18 @@ def main():
     # reset environment
     env.reset()
     # simulate environment
+    i =0
     while simulation_app.is_running():
         # run everything in inference mode
         with torch.inference_mode():
+            if i % 3 == 0:
+                idx = torch.randint(env.unwrapped.action_space.shape[0], (2,))
+                env.unwrapped.command_manager._terms['object_pose'].metrics['consecutive_success'][idx] = 100
+                env.reset()
             # sample actions from -1 to 1
             actions = 2 * torch.rand(env.action_space.shape, device=env.unwrapped.device) - 1
             # apply actions
-            env.step(actions)
+            returns = env.step(actions)
 
     # close the simulator
     env.close()
@@ -70,3 +75,5 @@ if __name__ == "__main__":
     main()
     # close sim app
     simulation_app.close()
+
+# self._env.command_manager._terms['object_pose'].metrics['consecutive_success'][-1] = self.threshold + 1
