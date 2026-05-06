@@ -60,11 +60,13 @@ def main():
             if i % 3 == 0:
                 idx = torch.randint(env.unwrapped.action_space.shape[0], (2,))
                 env.unwrapped.command_manager._terms['object_pose'].metrics['consecutive_success'][idx] = 100
-                env.reset()
+                env.unwrapped.reset(env_ids=idx.to('cuda'))
             # sample actions from -1 to 1
             actions = 2 * torch.rand(env.action_space.shape, device=env.unwrapped.device) - 1
             # apply actions
             returns = env.step(actions)
+            obs = returns[0]
+            # print(obs['policy'].shape)
 
     # close the simulator
     env.close()

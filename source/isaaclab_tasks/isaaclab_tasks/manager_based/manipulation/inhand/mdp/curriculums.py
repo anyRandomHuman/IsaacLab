@@ -1,645 +1,1763 @@
 from __future__ import annotations
-import re
-from turtledemo.forest import randomize
 
-from isaaclab.envs.mdp.curriculums import modify_env_param
-from isaaclab.managers.manager_term_cfg import ManagerTermBaseCfg
-from isaaclab.scene import InteractiveScene
-import torch
+import re
 from typing import TYPE_CHECKING, Sequence
 
-from isaaclab.managers import ManagerTermBase
-from isaaclab.assets import Articulation, RigidObject
+import torch
 
+import isaaclab.envs.mdp as mdp
+import isaaclab.utils.math as math_utils
+from isaaclab.assets import Articulation, RigidObject
+from isaaclab.managers import ManagerTermBase
+from isaaclab.managers.manager_term_cfg import ManagerTermBaseCfg
 from isaaclab.managers.scene_entity_cfg import SceneEntityCfg
+from isaaclab.sim.views import XformPrimView
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
-import isaaclab.envs.mdp as mdp
-import isaaclab.utils.math as math_utils
+
+
+def _is_mapping_like(obj) -> bool:
+    return isinstance(obj, dict) or (hasattr(obj, "keys") and callable(obj.keys))
+
+
+def build_getter(root, path: str):
+    parts: list[str | tuple[str, int]] = []
+    for part in path.split("."):
+        match = re.compile(r"^(\w+)\[(\d+)\]$").match(part)
+        if match:
+            parts.append((match.group(1), int(match.group(2))))
+        else:
+            parts.append(part)
+
+    def _getter():
+        value = root
+        for part in parts:
+            if isinstance(part, tuple):
+                name, idx = part
+                value = value[name] if _is_mapping_like(value) else getattr(value, name)
+                value = value[idx]
+            else:
+                value = value[part] if _is_mapping_like(value) else getattr(value, part)
+        return value
+
+    return _getter
+
+
+class CentralADRManager(ManagerTermBase):
+    """
+    Central coordinator that assigns random boundary-eval modes per reset.
+
+    must be init before all other curr terms
+
+    all other curr terms should register to make sure one envs has at most one boundary value
+    """
+
+    def __init__(self, cfg: ManagerTermBaseCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        # totoal dims to randomize, changes afte register
+        self.total_dims = 0
+        # ratio of envs that will not have boundary values assigned
+        self.train_ratio = float(getattr(cfg.params, "train_ratio", 0.6))
+        self.train_envs_count = int(self.num_envs * self.train_ratio)
+
+        # shape (n_envs), value between [-1, total_dims-1], where -1 means no boundary values assigned
+        self.modes = torch.full((self.num_envs,), -1, device=self.device, dtype=torch.long)
+        self.prev_modes = self.modes.clone()
+        env.central_adr_manager = self
+
+    def register_worker(self, num_dims: int) -> int:
+        """
+            num_dims: number of dims the curr term want to have boundary values
+            
+            return: the offset of its modes, the envs can set their boundary values when modes are in [offset, offset + num_dims) 
+        """
+        offset = self.total_dims
+        self.total_dims += int(num_dims)
+        return offset
+
+    def reset(self, env_ids: Sequence[int] | None = None) -> None:
+        """
+            env_ids: env_ids to reset
+            reassign the boundary modes
+        """
+        if env_ids is None:
+            env_ids = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
+        else:
+            env_ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
+
+        self.prev_modes[env_ids] = self.modes[env_ids]
+
+        if self.total_dims == 0:
+            self.modes[env_ids] = -1
+            return
+
+        modes = torch.full(env_ids.shape, -1, device=self.device, dtype=torch.long)
+        train_mask = torch.rand(modes.shape, device=self.device) < self.train_ratio
+        param_ids = torch.randint(self.total_dims, modes.shape, device=self.device, dtype=torch.long)
+        self.modes[env_ids] = torch.where(train_mask, modes, param_ids)
+
+    def get_reset_instructions(self, env_ids):
+        """
+            get the reset modes for current episode, used for assigning the values
+        """
+        ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
+        return self.modes[ids].clone()
+
+    def get_episode_result_instructions(self, env_ids):
+        """
+            get the reset modes for last episode, used for gathering the boundary eval results
+        """
+        ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
+        return self.prev_modes[ids].clone()
+
+    def __call__(self, *args, **kwargs):
+        return None
+
+
+class ADRDifficultyCore:
+    """
+    Reusable ADR difficulty state machine independent of asset/property application.
+
+    has a difficulty for both lower and upper bound of every param to randomize and each will be updated separately
+    the even idx are lower bounds, and odd idx are higher bounds
+
+    the difficulties will only be updated when evaled after sufficent number of times
+    """
+
+    def __init__(
+        self,
+        *,
+        device: torch.device,
+        num_envs: int,
+        central_adr_manager: CentralADRManager,
+        param_shape: int,
+        eval_interval: int,
+        max_difficulty: int,
+        upgrade_threshold: float,
+        downgrade_threshold: float,
+    ):
+        """
+            param_shape: should be 2 * n_actual params (lower and higher bound)
+        """
+        if param_shape <= 0:
+            raise ValueError(f"ADRDifficultyCore requires param_shape > 0. Got: {param_shape}.")
+        self.device = device
+        self.num_envs = int(num_envs)
+        self.param_shape = int(param_shape) 
+        self.eval_interval = int(eval_interval) # the number of times for boundary eval before updating difficulty
+        self.max_difficulty = int(max_difficulty)
+        self.upgrade_threshold = float(upgrade_threshold)
+        self.downgrade_threshold = float(downgrade_threshold)
+
+        self.mode_offset = int(central_adr_manager.register_worker(self.param_shape)) #mode offset from CentralADRManager
+        #the range of modes that corrsponds to boundary, the even idx are lower bound and the odd idx are higer bounds
+        self.mode_range = torch.arange(self.mode_offset, self.mode_offset + self.param_shape, device=self.device, dtype=torch.long) 
+        self.difficulties = torch.zeros(self.param_shape, device=self.device)
+        self.consecutive_success_counter = torch.zeros((self.param_shape, self.eval_interval), device=self.device)
+        self.eval_counts = torch.zeros(self.param_shape, dtype=torch.long, device=self.device)
+        self.first_update = True
+
+    def update_from_episode(
+        self,
+        env_ids: torch.Tensor,
+        central_adr_manager: CentralADRManager,
+        success_values: torch.Tensor,
+    ) -> None:
+        
+        """
+            counts the results for the boundary values and iff the evals are suffcient, update the difficulties
+            if the mean success rate is below lower threshold, downgrade threshold and if higher than upgrade threshold, upgrade
+            otherwise stay the same
+        """
+        env_ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
+        if len(env_ids) == 0:
+            return
+        if self.first_update:
+            self.first_update = False
+            return
+
+        success_values = torch.as_tensor(success_values, device=self.device).reshape(-1)
+        if success_values.shape[0] != self.num_envs:
+            raise ValueError(
+                f"ADRDifficultyCore expected success values with leading dim num_envs={self.num_envs}, "
+                f"got shape {tuple(success_values.shape)}."
+            )
+
+        reset_modes = central_adr_manager.get_episode_result_instructions(env_ids).to(self.device)
+        is_bound_envs = torch.isin(reset_modes, self.mode_range)
+        if not is_bound_envs.any():
+            return
+
+        bound_env_ids = env_ids[is_bound_envs]
+        bound_results = success_values[bound_env_ids].float()
+        param_idx = (reset_modes[is_bound_envs] - self.mode_offset).long()
+
+        for idx in torch.unique(param_idx):
+            idx_int = int(idx.item())
+            idx_mask = param_idx == idx
+            idx_results = bound_results[idx_mask]
+            num_new = int(idx_results.numel())
+            start = int(self.eval_counts[idx_int].item())
+            insert_indices = (start + torch.arange(num_new, device=self.device)) % self.eval_interval
+            self.consecutive_success_counter[idx_int, insert_indices] = idx_results
+            self.eval_counts[idx_int] += num_new
+
+            if int(self.eval_counts[idx_int].item()) < self.eval_interval:
+                continue
+
+            avg_success = float(self.consecutive_success_counter[idx_int].mean().item())
+            if avg_success >= self.upgrade_threshold:
+                self.difficulties[idx_int] = torch.clamp(self.difficulties[idx_int] + 1.0, 0.0, float(self.max_difficulty))
+                self.consecutive_success_counter[idx_int] = 0.0
+                self.eval_counts[idx_int] = 0
+            elif avg_success <= self.downgrade_threshold:
+                self.difficulties[idx_int] = torch.clamp(self.difficulties[idx_int] - 1.0, 0.0, float(self.max_difficulty))
+                self.consecutive_success_counter[idx_int] = 0.0
+                self.eval_counts[idx_int] = 0
+
+    def sample_uniform_values(
+        self,
+        *,
+        env_ids: torch.Tensor,
+        reset_modes: torch.Tensor,
+        initial_low: torch.Tensor,
+        initial_high: torch.Tensor,
+        step_size: torch.Tensor,
+        limit_low: torch.Tensor,
+        limit_high: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+            sample the values for the every params uniformly from the range between [current_lower, current higher]
+            and if a env is assigned a boundary, change the corresponding value to lower/upper bound
+        """
+        env_ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
+        if len(env_ids) == 0:
+            return torch.zeros((0, initial_low.shape[-1]), device=self.device, dtype=initial_low.dtype)
+
+        low_diff, high_diff = self.difficulties[0::2], self.difficulties[1::2]
+        low = initial_low[env_ids] - (low_diff[None] * step_size[env_ids])
+        low = torch.clamp(low, min=limit_low[env_ids], max=limit_high[env_ids])
+        high = initial_high[env_ids] + (high_diff[None] * step_size[env_ids])
+        high = torch.clamp(high, min=limit_low[env_ids], max=limit_high[env_ids])
+
+        values = torch.rand_like(high) * (high - low) + low
+
+        is_bound_envs = torch.isin(reset_modes, self.mode_range)
+        if is_bound_envs.any():
+            param_idx = (reset_modes[is_bound_envs] - self.mode_offset).long()
+            physical_dim_idx = param_idx // 2
+            is_lower_bound = (param_idx % 2 == 0)
+            bound_rows = torch.nonzero(is_bound_envs).squeeze(-1)
+            lower_rows = bound_rows[is_lower_bound]
+            upper_rows = bound_rows[~is_lower_bound]
+            lower_dims = physical_dim_idx[is_lower_bound]
+            upper_dims = physical_dim_idx[~is_lower_bound]
+            values[lower_rows, lower_dims] = low[lower_rows, lower_dims]
+            values[upper_rows, upper_dims] = high[upper_rows, upper_dims]
+
+        return values
+
+    def summarize(self, max_difficulty: float) -> dict[str, torch.Tensor]:
+        """
+            summarize the values for logging
+        """
+        difficulties = self.difficulties.float()
+        return {
+            "mean": difficulties.mean(),
+            "std": difficulties.std(unbiased=False),
+            "min": difficulties.min(),
+            "max": difficulties.max(),
+            "p50": torch.quantile(difficulties, 0.5),
+            "p90": torch.quantile(difficulties, 0.9),
+            "frac_at_max": (difficulties >= float(max_difficulty)).float().mean(),
+        }
 
 
 class ConsecutiveSuccessADR(ManagerTermBase):
     """
-    Adaptive Domain Randomization (ADR) for joint stiffness.
-
-    This term monitors the consecutive successes of the agents. When the maximum
-    consecutive success count across the environment exceeds a specified threshold,
-    it widens the uniform distribution range [min, max] from which joint stiffness
-    is sampled during reset.
+    Refactored ADR worker:
+    - difficulty/mode state in ADRDifficultyCore
+    - subclasses only define defaults/limits and `set_values`. (ideally)
     """
 
     def __init__(self, cfg: ManagerTermBaseCfg, env: ManagerBasedRLEnv):
         super().__init__(cfg, env)
 
-        self.asset_cfg = cfg.params.get('asset_cfg')
-        self.asset: Articulation | RigidObject = env.scene[self.asset_cfg.name]
-        
+        self.asset_cfg = cfg.params.get("asset_cfg", None)
+        self.asset: Articulation | RigidObject | None = None
+        if self.asset_cfg is not None:
+            self.asset = env.scene[self.asset_cfg.name]
 
+        self.max_difficulty = int(cfg.params.get("max_difficulty", 20))
+        self.upgrade_threshold = float(cfg.params.get("upgrade_threshold", 0.7))
+        self.downgrade_threshold = float(cfg.params.get("downgrade_threshold", 0.1))
+        self.eval_interval = int(cfg.params.get("eval_interval", 256))
+
+        # frequence for logging
+        self.log_every_resets = max(1, int(cfg.params.get("log_every_resets", 1)))
+        self.log_watch_indices = [int(i) for i in cfg.params.get("log_watch_indices", [])]
+        self._log_counter = 0
+
+        # the path for getting the success indicator 
+        success_path = cfg.params.get(
+            "success_key",
+            "command_manager._terms.object_pose.metrics.consecutive_success",
+        )
+        self.success_getter = build_getter(self._env, success_path)
+
+        self.central_adr_manager: CentralADRManager = env.central_adr_manager
+        # difficulty manager
+        self._external_adr_core: ADRDifficultyCore | None = cfg.params.get("shared_adr_core", None)
+        # adandonded compnent, ignore
+        self._owns_difficulty_updates = bool(cfg.params.get("owns_difficulty_updates", self._external_adr_core is None))
+
+        # the default values, by default the center of the randomized values and by default decides the stepsize
         self.defaults: torch.Tensor
         self._set_defaults()
 
-        self.initial_low = cfg.params.get("initial_low", self.defaults[0])
-        self.initial_low = self.initial_low.to(self.defaults.device)
+        # for the obs and action noise, the shape may need to be infered from the given observaion function
+        # they will need to initialize those in first reset
+        self._defer_adr_init = bool(getattr(self, "_defer_adr_init", False))
+        self.param_shape = (
+            int(getattr(self, "param_shape"))
+            if hasattr(self, "param_shape")
+            else (0 if self._defer_adr_init else 2 * int(self._resolve_feature_dim()))
+        )
 
-        self.initial_high = cfg.params.get("initial_high", self.defaults[0])
-        self.initial_high = self.initial_high.to(self.defaults.device)
+        self.limits_set = False
+        self._initialized = False
+        self.adr_core: ADRDifficultyCore | None = None
+        if not self._defer_adr_init:
+            self._initialize_worker_state()
 
-        self.step_size = cfg.params.get("step_size", (1 / 100 * self.defaults[0]))  # Amount to widen range by
-        self.step_size = self.step_size.to(self.defaults.device)
+    @property
+    def difficulties(self) -> torch.Tensor:
+        return self.adr_core.difficulties if self.adr_core is not None else torch.zeros(0, device=self.device)
 
-        self.limit_low = cfg.params.get("limit_low", torch.full_like(self.defaults[0], 0))
-        self.limit_low = self.limit_low.to(self.defaults.device)
+    @property
+    def mode_offset(self) -> int:
+        return int(self.adr_core.mode_offset) if self.adr_core is not None else -1
 
-        self.limit_high = cfg.params.get("limit_high", self.defaults[0] * 2)  # Hard max limit
-        self.limit_high = self.limit_high.to(self.defaults.device)
+    @property
+    def mode_range(self) -> torch.Tensor:
+        if self.adr_core is None:
+            return torch.zeros(0, dtype=torch.long, device=self.device)
+        return self.adr_core.mode_range
 
-        self.threshold = cfg.params.get("success_threshold", 20)
-        self.count_success = cfg.params.get('count_success',
-                                            False)  # counts success or use current value as consecutive success
+    @property
+    def consecutive_success_counter(self) -> torch.Tensor:
+        if self.adr_core is None:
+            return torch.zeros((0, self.eval_interval), device=self.device)
+        return self.adr_core.consecutive_success_counter
 
-        success_path = cfg.params.get('success_key',
-                                      'command_manager._terms.object_pose.metrics.consecutive_success')  # key of success, if None, will try find itself
-        self.success_getter = self.process_getter(self._env, success_path)
+    @property
+    def eval_counts(self) -> torch.Tensor:
+        if self.adr_core is None:
+            return torch.zeros(0, dtype=torch.long, device=self.device)
+        return self.adr_core.eval_counts
 
-        self.max_difficulty = cfg.params.get('max_difficulty', 10)
-        self.global_success = cfg.params.get('global_success', True)
-        unrandomized_ratio = cfg.params.get('unrandomized_ratio', 0.4)
-        self.max_unrandomized_idx = int(self._env.num_envs * unrandomized_ratio)
+    def _normalize_env_ids(self, env_ids: Sequence[int] | torch.Tensor | None) -> torch.Tensor:
+        if env_ids is None:
+            return torch.arange(self.num_envs, device=self.device, dtype=torch.long)
+        return torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
 
-        # Current range state
-        self.difficulties = torch.zeros(self._env.num_envs, dtype=torch.int, device=self.defaults.device)
+    def _resolve_feature_dim(self) -> int:
+        if self.defaults is None:
+            raise ValueError(f"{self.__class__.__name__} defaults must be initialized before resolving feature dim.")
+        return int(self.defaults.shape[-1])
 
-        # Track consecutive successes globally (or per env depending on ADR strategy)
-        # Here we track the max consecutive success achieved in the current difficulty block
-        self.consecutive_success_counter = torch.zeros(self._env.num_envs if not self.global_success else 1,
-                                                       device=self.defaults.device)
-        self.values = None
-
-    def reset(self, env_ids: Sequence[int] | None = None) -> None:
-        env_ids = env_ids.to(self.defaults.device)
-        level_up_env_ids = self._manage_difficulty(env_ids=env_ids)
-
-        if len(level_up_env_ids) == 0:
+    def _initialize_worker_state(self) -> None:
+        """
+            set the hard limits for the to randomize values and init the difficulty manager 
+        """
+        if self._initialized:
             return
 
-        self.values = self._get_new_values(level_up_env_ids)
+        if not self.limits_set:
+            self._set_limits_and_stepsize()
 
-    def _manage_difficulty(self, env_ids):
-        env_ids = env_ids[env_ids > self.max_unrandomized_idx].to(self.defaults.device)
-
-        if len(env_ids) == 0:
-            return []
-
-        if self.global_success:
-            if self.count_success:
-                self.consecutive_success_counter = self.consecutive_success_counter + self.success_getter() if self.success_getter() else 0
-            else:
-                self.consecutive_success_counter = self.success_getter()
-            if max(self.consecutive_success_counter[env_ids]) >= self.threshold:
-                self.difficulties[env_ids] = torch.full_like(self.difficulties[env_ids], self.difficulties.max() + 1)
-                self.difficulties = self.difficulties.clamp(0, self.max_difficulty)
-                return env_ids
-            return []
+        if self._external_adr_core is not None:
+            self.adr_core = self._external_adr_core
+            if self.param_shape <= 0:
+                self.param_shape = int(self.adr_core.param_shape)
         else:
-            if self.count_success:
-                current_successes = self.success_getter()[env_ids] > 0
-
-                # Find indices in the subset that failed
-                failed_mask = ~current_successes
-                failed_env_ids = env_ids[failed_mask]
-                if len(failed_env_ids) > 0:
-                    self.consecutive_success_counter[failed_env_ids] = 0
-
-                # B. Handle Successes (Increment counter)
-                succeeded_mask = current_successes
-                succeeded_env_ids = env_ids[succeeded_mask]
-                if len(succeeded_env_ids) > 0:
-                    self.consecutive_success_counter[succeeded_env_ids] += 1
-            else:
-                self.consecutive_success_counter[env_ids] = self.success_getter()[env_ids]
-
-            # Check who crossed the threshold
-            level_up_mask = self.consecutive_success_counter[env_ids] > self.threshold
-            level_up_env_ids = env_ids[level_up_mask]
-
-            if len(level_up_env_ids) > 0:
-                # Increment difficulty level, clamped to max_level
-                new_levels = self.difficulties[level_up_env_ids] + 1
-                new_levels = torch.clamp(new_levels, max=self.max_difficulty)
-                self.difficulties[level_up_env_ids] = new_levels
-                self.consecutive_success_counter[level_up_env_ids] = 0
-
-        return level_up_env_ids
-
-    def process_getter(self, root, path):
-        path_parts: list[str | tuple[str, int]] = []
-        for part in path.split("."):
-            m = re.compile(r"^(\w+)\[(\d+)\]$").match(part)
-            if m:
-                path_parts.append((m.group(1), int(m.group(2))))
-            else:
-                path_parts.append(part)
-
-        # Traverse the parts to find the container
-        container = root
-        for container_path in path_parts[:-1]:
-            if isinstance(container_path, tuple):
-                # we are accessing a list element
-                name, idx = container_path
-                # find underlying attribute
-                if isinstance(container_path, dict):
-                    seq = container[name]  # type: ignore[assignment]
-                else:
-                    seq = getattr(container, name)
-                # save the container for the next iteration
-                container = seq[idx]
-            else:
-                # we are accessing a dictionary key or an attribute
-                if isinstance(container, dict) or (hasattr(container, 'keys') and callable(container.keys())):
-                    container = container[container_path]
-                else:
-                    container = getattr(container, container_path)
-
-        # save the container and the last part of the path
-        self._container = container
-        self._last_path = path_parts[-1]  # for "a.b[2].c", this is "c", while for "a.b[2]" it is 2
-
-        # build the getter and setter
-        if isinstance(self._container, tuple):
-            get_value = lambda: self._container[self._last_path]  # noqa: E731
-
-
-        elif isinstance(self._container, (list, dict)):
-            get_value = lambda: self._container[self._last_path]  # noqa: E731
-
-        elif isinstance(self._container, object):
-            get_value = lambda: getattr(self._container, self._last_path)  # noqa: E731
-        else:
-            raise TypeError(
-                f"Unable to build accessors for address '{path}'. Unknown type found for access variable:"
-                f" '{type(self._container)}'. Expected a list, dict, or object with attributes."
+            feature_dim = self._resolve_feature_dim()
+            if self.param_shape <= 0:
+                self.param_shape = 2 * feature_dim
+            self.adr_core = ADRDifficultyCore(
+                device=self.device,
+                num_envs=self.num_envs,
+                central_adr_manager=self.central_adr_manager,
+                param_shape=self.param_shape,
+                eval_interval=self.eval_interval,
+                max_difficulty=self.max_difficulty,
+                upgrade_threshold=self.upgrade_threshold,
+                downgrade_threshold=self.downgrade_threshold,
             )
 
-        return get_value
+        self._initialized = True
 
-    def _get_new_values(self, env_ids):
+    def _ensure_initialized(self) -> None:
+        if not self._initialized:
+            self._initialize_worker_state()
+
+    def _expand_param(self, value, default_value: torch.Tensor) -> torch.Tensor:
+        if value is None:
+            tensor = default_value.clone()
+        elif isinstance(value, torch.Tensor):
+            tensor = value.to(default_value.device, dtype=default_value.dtype)
+        else:
+            tensor = torch.tensor(value, device=default_value.device, dtype=default_value.dtype)
+
+        feature_dim = int(default_value.shape[-1])
+
+        if tensor.ndim == 0:
+            tensor = tensor.repeat(feature_dim)
+        if tensor.ndim == 1:
+            if tensor.shape[0] == 1:
+                tensor = tensor.repeat(feature_dim)
+            elif tensor.shape[0] != feature_dim:
+                raise ValueError(
+                    f"{self.__class__.__name__} parameter has wrong shape {tuple(tensor.shape)} for feature dim={feature_dim}."
+                )
+            return tensor.unsqueeze(0).repeat(self.num_envs, 1)
+        if tensor.ndim == 2:
+            if tensor.shape[1] != feature_dim:
+                raise ValueError(
+                    f"{self.__class__.__name__} parameter has wrong shape {tuple(tensor.shape)} for feature dim={feature_dim}."
+                )
+            if tensor.shape[0] == 1:
+                return tensor.repeat(self.num_envs, 1)
+            if tensor.shape[0] != self.num_envs:
+                raise ValueError(
+                    f"{self.__class__.__name__} parameter has wrong env dimension {tensor.shape[0]} for num_envs={self.num_envs}."
+                )
+            return tensor
+
+        raise ValueError(f"{self.__class__.__name__} parameter rank must be <= 2. Got: {tensor.ndim}.")
+
+    def sample_values(self, env_ids: torch.Tensor) -> torch.Tensor:
         """
-        env_ids: the envs that shuold be randomized
-        return: values uniformly sampled in the linear increasing range
+            if not inited, init
+            get the reset modes and sample values
         """
-        if len(env_ids) == 0:
+        self._ensure_initialized()
+        reset_modes = self.central_adr_manager.get_reset_instructions(env_ids).to(self.device)
+        return self.adr_core.sample_uniform_values(
+            env_ids=env_ids,
+            reset_modes=reset_modes,
+            initial_low=self.initial_low,
+            initial_high=self.initial_high,
+            step_size=self.step_size,
+            limit_low=self.limit_low,
+            limit_high=self.limit_high,
+        )
+
+    def reset(self, env_ids: Sequence[int] | None = None) -> None:
+        """
+            update the difficulty, then sample the new values, finally apply the new values
+        """
+        self._ensure_initialized()
+        env_ids_t = self._normalize_env_ids(env_ids)
+        if len(env_ids_t) == 0:
             return
 
-        low = self.initial_low - (self.difficulties[env_ids][:, None] * self.step_size)  # (env_ids, property_shape)
-        self.low = torch.clamp(low, min=self.limit_low, max=self.limit_high)
+        if self._owns_difficulty_updates:
+            self.adr_core.update_from_episode(
+                env_ids=env_ids_t,
+                central_adr_manager=self.central_adr_manager,
+                success_values=self.success_getter(),
+            )
 
-        high = self.initial_high + (self.difficulties[env_ids][:, None] * self.step_size)
-        self.high = torch.clamp(high, min=self.limit_low, max=self.limit_high)
+        values = self.sample_values(env_ids_t)
+        self.set_values(env_ids_t, values)
 
-        values = torch.rand_like(self.high) * (high - low) + low
+    def change_property(self, env_ids, values):
+        # Compatibility shim for older subclasses/call sites.
+        self.set_values(env_ids, values)
 
-        return values
+    def set_values(self, env_ids, values):
+        raise NotImplementedError
 
     def __call__(self, *args, **kwargs):
-        pass
+        """
+            get the logs and log
+        """
+        self._ensure_initialized()
+        self._log_counter += 1
+        if self._log_counter % self.log_every_resets != 0:
+            return None
+        out = self.adr_core.summarize(self.max_difficulty)
+        for idx in self.log_watch_indices:
+            if 0 <= idx < self.difficulties.numel():
+                out[f"watch_{idx}"] = self.difficulties[idx]
+        self._env.max_difficulty = self.difficulties.max() if self.difficulties.numel() > 0 else torch.tensor(0.0)
+        self._env.mean_difficulty = self.difficulties.mean() if self.difficulties.numel() > 0 else torch.tensor(0.0)
+        return out
 
     def _set_defaults(self):
         raise NotImplementedError
 
+    def _set_limits_and_stepsize(self):
+        step_default = self.defaults / 100.0
+        self.initial_low = self._expand_param(self.cfg.params.get("initial_low", None), self.defaults)
+        self.initial_high = self._expand_param(self.cfg.params.get("initial_high", None), self.defaults)
+        self.step_size = self._expand_param(self.cfg.params.get("step_size", None), step_default)
+        self.limit_low = self._expand_param(self.cfg.params.get("limit_low", None), torch.zeros_like(self.defaults))
+        self.limit_high = self._expand_param(self.cfg.params.get("limit_high", None), 2.0 * self.defaults)
+        self.limits_set = True
+
+
 class RobotCSADR(ConsecutiveSuccessADR):
     def __init__(self, cfg, env):
+        """
+            handles the body and joint ids 
+        """
+        asset_cfg = cfg.params.get("asset_cfg")
+        assert isinstance(env.scene[asset_cfg.name], Articulation)
+        if not asset_cfg.joint_names:
+            asset_cfg.joint_names = ".*"
+        if not asset_cfg.body_names:
+            asset_cfg.body_names = ".*"
+        self.joint_ids, self.joint_names = env.scene[asset_cfg.name].find_joints(asset_cfg.joint_names)
+        self.body_ids, self.body_names = env.scene[asset_cfg.name].find_bodies(asset_cfg.body_names)
         super().__init__(cfg, env)
-        assert isinstance(self.asset, Articulation)
-        if not self.asset_cfg.joint_names:
-            self.asset_cfg.joint_names = '.*'
-        if not self.asset_cfg.body_names:
-            self.asset_cfg.body_names = '.*'
-        self.joint_ids, self.joint_names = self.asset.find_joints(self.asset_cfg.joint_names)
-        self.body_ids, self.body_names = self.asset.find_bodies(self.asset_cfg.body_names)
+
 
 class RobotJointCSADR(RobotCSADR):
-    def _get_new_values(self, env_ids):
-        return super()._get_new_values(env_ids)[:, self.joint_ids]
-    
+    pass
+
 
 class RobotBodyCSADR(RobotCSADR):
-    def _get_new_values(self, env_ids):
-        return super()._get_new_values(env_ids)[:, self.body_ids]
-    
+    pass
+
 
 class RobotJointStiffnessCSADR(RobotJointCSADR):
-    def __init__(self, cfg, env):
-        super().__init__(cfg, env)
-
-    def reset(self, env_ids: Sequence[int] | None = None) -> None:
-        level_up_env_ids = self._manage_difficulty(env_ids)
-
-        if len(level_up_env_ids) == 0:
-            return
-
-        values = self._get_new_values(level_up_env_ids)
-        self.asset.write_joint_stiffness_to_sim(values, env_ids=level_up_env_ids, joint_ids=self.joint_ids)  # type: ignore
+    def set_values(self, env_ids, values):
+        self.asset.write_joint_stiffness_to_sim(values, env_ids=env_ids, joint_ids=self.joint_ids)
 
     def _set_defaults(self):
-        self.defaults = self.asset.data.joint_stiffness
+        self.defaults = self.asset.data.joint_stiffness[:, self.joint_ids].clone()
 
 
 class RobotDampingADR(RobotJointCSADR):
-    def __init__(self, cfg, env):
-        super().__init__(cfg, env)
+    def set_values(self, env_ids, values):
+        self.asset.write_joint_damping_to_sim(values, env_ids=env_ids, joint_ids=self.joint_ids)
 
-    def reset(self, env_ids: Sequence[int] | None = None) -> None:
-        level_up_env_ids = self._manage_difficulty(env_ids)
-
-        if len(level_up_env_ids) == 0:
-            return
-
-        values = self._get_new_values(level_up_env_ids)
-        self.asset.write_joint_damping_to_sim(values, env_ids=level_up_env_ids, joint_ids=self.joint_ids)
-    
     def _set_defaults(self):
-        self.defaults = self.asset.data.default_joint_damping
+        self.defaults = self.asset.data.default_joint_damping[:, self.joint_ids].clone()
 
-# default_joint_friction is deprecated, use default_joint_friction_coeff
+
 class RobotJointStaticFrictionADR(RobotJointCSADR):
-    def __init__(self, cfg, env):
-        super().__init__(cfg, env)
-
-    def reset(self, env_ids: Sequence[int] | None = None) -> None:
-        level_up_env_ids = self._manage_difficulty(env_ids)
-
-        if len(level_up_env_ids) == 0:
-            return
-
-        values = self._get_new_values(level_up_env_ids)
-        self.asset.write_joint_friction_coefficient_to_sim(values, joint_ids=self.joint_ids, 
-                                                           env_ids=level_up_env_ids)
+    def set_values(self, env_ids, values):
+        self.asset.write_joint_friction_coefficient_to_sim(values, env_ids=env_ids, joint_ids=self.joint_ids)
 
     def _set_defaults(self):
-        self.defaults = self.asset.data.default_joint_friction_coeff.clone()
+        self.defaults = self.asset.data.default_joint_friction_coeff[:, self.joint_ids].clone()
+
 
 class RobotJointDynamicFrictionADR(RobotJointCSADR):
-    def __init__(self, cfg, env):
-        super().__init__(cfg, env)
-
-    def reset(self, env_ids: Sequence[int] | None = None) -> None:
-        level_up_env_ids = self._manage_difficulty(env_ids)
-
-        if len(level_up_env_ids) == 0:
-            return
-
-        values = self._get_new_values(level_up_env_ids)
+    def set_values(self, env_ids, values):
         self.asset.write_joint_friction_coefficient_to_sim(
-            joint_friction_coeff=self.asset.data.joint_friction_coeff[level_up_env_ids[:, None], self.joint_ids],
-            joint_dynamic_friction_coeff=values, 
-            joint_ids=self.joint_ids, 
-            env_ids=level_up_env_ids)
+            joint_friction_coeff=self.asset.data.joint_friction_coeff[env_ids[:, None], self.joint_ids],
+            joint_dynamic_friction_coeff=values,
+            joint_ids=self.joint_ids,
+            env_ids=env_ids,
+        )
 
     def _set_defaults(self):
-        self.defaults = self.asset.data.default_joint_dynamic_friction_coeff.clone()
+        self.defaults = self.asset.data.default_joint_dynamic_friction_coeff[:, self.joint_ids].clone()
 
 
 class RobotJointViscousFrictionADR(RobotJointCSADR):
-    def __init__(self, cfg, env):
-        super().__init__(cfg, env)
-
-    def reset(self, env_ids: Sequence[int] | None = None) -> None:
-        level_up_env_ids = self._manage_difficulty(env_ids)
-
-        if len(level_up_env_ids) == 0:
-            return
-
-        values = self._get_new_values(level_up_env_ids)
+    def set_values(self, env_ids, values):
         self.asset.write_joint_friction_coefficient_to_sim(
-            joint_friction_coeff=self.asset.data.joint_friction_coeff[level_up_env_ids[:, None], self.joint_ids],
-            joint_viscous_friction_coeff=values, 
-            joint_ids=self.joint_ids, 
-            env_ids=level_up_env_ids)
+            joint_friction_coeff=self.asset.data.joint_friction_coeff[env_ids[:, None], self.joint_ids],
+            joint_viscous_friction_coeff=values,
+            joint_ids=self.joint_ids,
+            env_ids=env_ids,
+        )
 
     def _set_defaults(self):
-        self.defaults = self.asset.data.default_joint_viscous_friction_coeff.clone()
+        self.defaults = self.asset.data.default_joint_viscous_friction_coeff[:, self.joint_ids].clone()
 
 
 class IndividualArmatureADR(ConsecutiveSuccessADR):
     def __init__(self, cfg, env):
-        self.actuator = cfg.params.get('actuators', 'joint')
+        self.actuator = cfg.params.get("actuators", "joint")
         super().__init__(cfg, env)
 
-    def reset(self, env_ids=None):
-        to_set_ids = self._manage_difficulty(env_ids)
-
-        if len(to_set_ids) == 0:
-            return
-
-        values = self._get_new_values(to_set_ids)
-        self.asset.actuators[self.actuator].armature[to_set_ids] = values
+    def set_values(self, env_ids, values):
+        actuator = self.asset.actuators[self.actuator]
+        if isinstance(self._selected_joint_ids_local, slice):
+            actuator.armature[env_ids] = values.to(actuator.armature.device)
+        else:
+            actuator.armature[env_ids[:, None], self._selected_joint_ids_local] = values.to(actuator.armature.device)
+        self.asset.write_joint_armature_to_sim(values, joint_ids=self._selected_joint_ids_global, env_ids=env_ids)
 
     def _set_defaults(self):
-        self.defaults = self.asset.actuators[self.actuator].armature
+        actuator = self.asset.actuators[self.actuator]
+        self._selected_joint_ids_global, self._selected_joint_ids_local = self._resolve_selected_joint_ids(actuator)
+        if isinstance(self._selected_joint_ids_local, slice):
+            self.defaults = actuator.armature.to(self.device).clone()
+        else:
+            self.defaults = actuator.armature[:, self._selected_joint_ids_local].to(self.device).clone()
+
+    def _resolve_actuator_global_joint_ids(self, actuator) -> torch.Tensor:
+        if isinstance(actuator.joint_indices, slice):
+            return torch.arange(self.asset.num_joints, device=self.device, dtype=torch.long)[actuator.joint_indices]
+        if isinstance(actuator.joint_indices, torch.Tensor):
+            return actuator.joint_indices.to(self.device).long()
+        raise TypeError("Actuator joint indices must be a slice or a torch.Tensor.")
+
+    def _resolve_selected_joint_ids(self, actuator) -> tuple[slice | torch.Tensor, slice | torch.Tensor]:
+        joint_ids = self.cfg.params.get("joint_ids", None)
+        joint_names = self.cfg.params.get("joint_names", None)
+        if joint_ids is None and self.asset_cfg is not None and self.asset_cfg.joint_ids != slice(None):
+            joint_ids = self.asset_cfg.joint_ids
+        if joint_names is None and self.asset_cfg is not None and self.asset_cfg.joint_names is not None:
+            joint_names = self.asset_cfg.joint_names
+
+        if joint_ids is None and joint_names is None:
+            return self._resolve_actuator_global_joint_ids(actuator), slice(None)
+
+        selected_global_ids = None
+        if joint_ids is not None:
+            if isinstance(joint_ids, slice):
+                selected_global_ids = torch.arange(self.asset.num_joints, device=self.device, dtype=torch.long)[joint_ids]
+            else:
+                selected_global_ids = torch.as_tensor(joint_ids, dtype=torch.long, device=self.device).view(-1)
+
+        if joint_names is not None:
+            joint_expr = joint_names if isinstance(joint_names, str) else "|".join(joint_names)
+            matched_ids, _ = self.asset.find_joints(joint_expr)
+            matched_ids = torch.as_tensor(matched_ids, dtype=torch.long, device=self.device).view(-1)
+            if selected_global_ids is None:
+                selected_global_ids = matched_ids
+            else:
+                selected_global_ids = selected_global_ids[torch.isin(selected_global_ids, matched_ids)]
+
+        if selected_global_ids is None or selected_global_ids.numel() == 0:
+            raise ValueError(
+                f"IndividualArmatureADR for actuator '{self.actuator}' received no valid joint selection."
+            )
+
+        actuator_global_ids = self._resolve_actuator_global_joint_ids(actuator)
+        is_selected = torch.isin(actuator_global_ids, selected_global_ids)
+        local_indices = torch.nonzero(is_selected).view(-1)
+        if local_indices.numel() == 0:
+            raise ValueError(
+                f"Selected joints {selected_global_ids.tolist()} are not part of actuator '{self.actuator}'."
+            )
+        return actuator_global_ids[local_indices], local_indices
 
 
 class RobotArmatureADR(ManagerTermBase):
-
     def __init__(self, cfg, env):
         super().__init__(cfg, env)
-        self.asset_cfg = cfg.params.get('asset_cfg')
+        self.asset_cfg = cfg.params.get("asset_cfg")
         self.asset: Articulation = env.scene[self.asset_cfg.name]
-        self.actuators = getattr(cfg, 'actuators', list(self.asset.actuators.keys()))
+        self.actuators = getattr(cfg, "actuators", list(self.asset.actuators.keys()))
         self.adrs = []
         original_params = cfg.params
-        for k in self.actuators:
-            cfg.params = original_params | {'actuators': k}
-            adr = IndividualArmatureADR(cfg, env)
-            self.adrs.append(adr)
+        requested_global_ids = self._resolve_requested_global_joint_ids(original_params)
 
-    def reset(self, env_ids: Sequence[int] | None = None) -> None:
-        for i, adr in enumerate(self.adrs):
-            adr.reset(env_ids)
+        for actuator_name in self.actuators:
+            cfg.params = original_params | {"actuators": actuator_name}
+            if requested_global_ids is not None:
+                joint_indices = self.asset.actuators[actuator_name].joint_indices
+                if isinstance(joint_indices, slice):
+                    actuator_global_ids = torch.arange(self.asset.num_joints, device=self.device, dtype=torch.long)[joint_indices]
+                elif isinstance(joint_indices, torch.Tensor):
+                    actuator_global_ids = joint_indices.to(self.device).long()
+                else:
+                    raise TypeError("Actuator joint indices must be a slice or a torch.Tensor.")
 
-    def __call__(self, *args, **kwargs):
-        pass
+                per_actuator_ids = actuator_global_ids[torch.isin(actuator_global_ids, requested_global_ids)]
+                if per_actuator_ids.numel() == 0:
+                    continue
+                cfg.params = cfg.params | {"joint_ids": per_actuator_ids.tolist(), "joint_names": None}
+            self.adrs.append(IndividualArmatureADR(cfg, env))
 
+        if len(self.adrs) == 0:
+            raise ValueError("RobotArmatureADR found no actuator containing the requested joints.")
 
-class MaterialPropertyADR(ConsecutiveSuccessADR, mdp.randomize_rigid_body_material):
-    def __init__(self, cfg, env):
-        super().__init__(cfg, env)
+    def _resolve_requested_global_joint_ids(self, params) -> torch.Tensor | None:
+        joint_ids = params.get("joint_ids", None)
+        joint_names = params.get("joint_names", None)
+        if joint_ids is None and joint_names is None:
+            if self.asset_cfg.joint_ids != slice(None):
+                joint_ids = self.asset_cfg.joint_ids
+            elif self.asset_cfg.joint_names is not None:
+                joint_names = self.asset_cfg.joint_names
+        if joint_ids is None and joint_names is None:
+            return None
 
-    def reset(self, env_ids: Sequence[int] | None = None, *args, **kwargs) -> None:
-        to_set_ids = self._manage_difficulty(env_ids)
-
-        if len(to_set_ids) == 0:
-            return
-
-        values = self._get_new_values(to_set_ids)
-
-        # if to_set_ids is None:
-        #     to_set_ids = torch.arange(self._env.scene.num_envs, device=self.defaults.device)
-        # else:
-            # to_set_ids = to_set_ids.to(self.defaults.device)
-
-        # randomly assign material IDs to the geometries
-        total_num_shapes = self.asset.root_physx_view.max_shapes
-
-        # retrieve material buffer from the physics simulation
-        materials = self.asset.root_physx_view.get_material_properties()
-        values = values.to(materials.device)
-
-        # update material buffer with new samples
-        if self.num_shapes_per_body is not None:
-            # sample material properties from the given ranges
-            for body_id in self.asset_cfg.body_ids:
-                # obtain indices of shapes for the body
-                start_idx = sum(self.num_shapes_per_body[:body_id])
-                end_idx = start_idx + self.num_shapes_per_body[body_id]
-                # assign the new materials
-                # material samples are of shape: num_env_ids x total_num_shapes x 3
-                materials[to_set_ids, start_idx:end_idx] = values[:, start_idx:end_idx]
-        else:
-            materials[to_set_ids] = values[:]
-
-        self.asset.root_physx_view.set_material_properties(materials, to_set_ids)
-    
-    def _set_defaults(self):
-        self.defaults = self.asset.root_physx_view.get_material_properties()
-
-    def _get_new_values(self, env_ids):
-        """
-        env_ids: the envs that shuold be randomized
-        return: values uniformly sampled in the linear increasing range
-        """
-        if len(env_ids) == 0:
-            return
-
-        low = self.initial_low - (self.difficulties[env_ids][:, None, None] * self.step_size)  # (env_ids, property_shape)
-        self.low = torch.clamp(low, min=self.limit_low, max=self.limit_high)
-
-        high = self.initial_high + (self.difficulties[env_ids][:, None, None] * self.step_size)
-        self.high = torch.clamp(high, min=self.limit_low, max=self.limit_high)
-
-        values = torch.rand_like(self.high) * (high - low) + low
-
-        return values
-    
-
-class RobotMassADR(RobotBodyCSADR):
-    def __init__(self, cfg, env):
-        super().__init__(cfg, env)
-        self.recompute_inertia = cfg.params.get("recompute_inertia", True)
-
-    def reset(self, env_ids: Sequence[int] | None = None) -> None:
-        to_set_ids = self._manage_difficulty(env_ids)
-
-        if len(to_set_ids) == 0:
-            return
-
-        values = self._get_new_values(to_set_ids)
-        # self.asset.root_physx_view.set_masses(values, env_ids=to_set_ids)
-
-        # resolve body indices
-
-        body_ids = torch.tensor(self.body_ids, dtype=torch.int, device=self.defaults.device)
-
-        # get the current masses of the bodies (num_assets, num_bodies)
-        masses = self.asset.root_physx_view.get_masses()
-
-        masses[to_set_ids[:, None], body_ids] = values
-
-        # set the mass into the physics simulation
-        self.asset.root_physx_view.set_masses(masses, to_set_ids)
-
-        # recompute inertia tensors if needed
-        if self.recompute_inertia:
-            # compute the ratios of the new masses to the initial masses
-            ratios = masses[to_set_ids[:, None], body_ids] / self.asset.data.default_mass[to_set_ids[:, None], body_ids]
-            # scale the inertia tensors by the the ratios
-            # since mass randomization is done on default values, we can use the default inertia tensors
-            inertias = self.asset.root_physx_view.get_inertias()
-            if isinstance(self.asset, Articulation):
-                # inertia has shape: (num_envs, num_bodies, 9) for articulation
-                inertias[to_set_ids[:, None], body_ids] = (
-                    self.asset.data.default_inertia[to_set_ids[:, None], body_ids] * ratios[..., None]
-                )
+        selected_ids = None
+        if joint_ids is not None:
+            if isinstance(joint_ids, slice):
+                selected_ids = torch.arange(self.asset.num_joints, device=self.device, dtype=torch.long)[joint_ids]
             else:
-                # inertia has shape: (num_envs, 9) for rigid object
-                inertias[to_set_ids] = self.asset.data.default_inertia[to_set_ids] * ratios
-            # set the inertia tensors into the physics simulation
-            self.asset.root_physx_view.set_inertias(inertias, to_set_ids)
-    
-    def _set_defaults(self):
-        self.defaults = self.asset.data.default_mass
+                selected_ids = torch.as_tensor(joint_ids, device=self.device, dtype=torch.long).view(-1)
 
-class AllObjecCSADR(ManagerTermBase):
-    def __init__(self, cfg, env):
-        super().__init__(cfg, env)
-        self.asset_cfgs = cfg.params.get("asset_cfgs", [SceneEntityCfg(name=f'object_{i}') for i in range(10)])
-        self.asset_names = [cfg.name for cfg in self.asset_cfgs]
-        self.assets = [env.scene[name] for name in self.asset_names]
-        env.active_asset_indices = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+        if joint_names is not None:
+            joint_expr = joint_names if isinstance(joint_names, str) else "|".join(joint_names)
+            matched_joint_ids, _ = self.asset.find_joints(joint_expr)
+            matched_joint_ids = torch.as_tensor(matched_joint_ids, dtype=torch.long, device=self.device).view(-1)
+            if selected_ids is None:
+                selected_ids = matched_joint_ids
+            else:
+                selected_ids = selected_ids[torch.isin(selected_ids, matched_joint_ids)]
 
-        cls = cfg.params.get("cls")
-
-        self.adrs = []
-        original_params = cfg.params
-        for asset_cfg in self.asset_cfgs:
-            cfg.params = original_params | {'asset_cfg': asset_cfg}
-            adr = cls(cfg, env)
-            self.adrs.append(adr)
+        if selected_ids is None or selected_ids.numel() == 0:
+            raise ValueError("RobotArmatureADR received an empty joint selection from `joint_ids` / `joint_names`.")
+        return selected_ids
 
     def reset(self, env_ids: Sequence[int] | None = None) -> None:
         for adr in self.adrs:
             adr.reset(env_ids)
 
     def __call__(self, *args, **kwargs):
-        pass
+        if len(self.adrs) == 0:
+            return None
+        difficulties = torch.cat([adr.difficulties.float().reshape(-1) for adr in self.adrs], dim=0)
+        if difficulties.numel() == 0:
+            return None
+        first_adr = self.adrs[0]
+        first_adr._log_counter += 1
+        if first_adr._log_counter % first_adr.log_every_resets != 0:
+            return None
+        return {
+            "mean": difficulties.mean(),
+            "std": difficulties.std(unbiased=False),
+            "min": difficulties.min(),
+            "max": difficulties.max(),
+            "p50": torch.quantile(difficulties, 0.5),
+            "p90": torch.quantile(difficulties, 0.9),
+            "frac_at_max": (difficulties >= max(float(adr.max_difficulty) for adr in self.adrs)).float().mean(),
+        }
+
+
+class MaterialPropertyADR(ConsecutiveSuccessADR):
+    PHYSX_MATERIAL_LIMIT = 64000
+
+    def __init__(self, cfg, env):
+        self.randomize_viscous = bool(cfg.params.get("randomize_viscous", False))
+        super().__init__(cfg, env)
+        self.num_buckets = int(cfg.params.get("num_buckets", 512))
+        if self.num_buckets < 2:
+            raise ValueError("MaterialPropertyADR requires num_buckets >= 2 for explicit min/max boundary buckets.")
+        if not isinstance(self.asset, (RigidObject, Articulation)):
+            raise ValueError(
+                f"Randomization term not supported for asset '{self.asset_cfg.name}' with type '{type(self.asset)}'."
+            )
+        self.num_shapes_per_body = None
+
+        max_unique_materials = int(cfg.params.get("max_unique_materials", self.PHYSX_MATERIAL_LIMIT))
+        total_candidate = (self.max_difficulty + 1) * (self.max_difficulty + 1) * self.num_buckets
+        if total_candidate > max_unique_materials:
+            self.num_buckets = self.PHYSX_MATERIAL_LIMIT // ((self.max_difficulty + 1) * (self.max_difficulty + 1))
+
+        self.material_buckets = torch.zeros(
+            (self.max_difficulty + 1, self.max_difficulty + 1, self.num_buckets, 3), device=self.device
+        )
+        for low_i in range(self.max_difficulty + 1):
+            low = self.initial_low - (low_i * self.step_size)
+            low = torch.clamp(low, min=self.limit_low, max=self.limit_high)
+            for high_i in range(self.max_difficulty + 1):
+                high = self.initial_high + (high_i * self.step_size)
+                high = torch.clamp(high, min=self.limit_low, max=self.limit_high)
+                samples = torch.rand((self.num_buckets, 3), device=self.device)
+                samples[0] = 0.0
+                samples[1] = 1.0
+                self.material_buckets[low_i, high_i] = samples * (high - low) + low
+
+        if bool(cfg.params.get("make_consistent", False)):
+            self.material_buckets[..., 1] = torch.min(self.material_buckets[..., 0], self.material_buckets[..., 1])
+
+    def _set_defaults(self):
+        self.total_num_shapes = self.asset.root_physx_view.max_shapes
+        all_materials = self.asset.root_physx_view.get_material_properties()[0]
+        if self.randomize_viscous:
+            self.defaults = all_materials.flatten().to(self.device).clone()
+        else:
+            self.defaults = all_materials[:, :2].flatten().to(self.device).clone()
+        self.param_shape = 2 * self.total_num_shapes
+
+    def _set_limits_and_stepsize(self):
+        self.initial_low = torch.as_tensor(
+            self.cfg.params.get("initial_low", torch.tensor([1.0, 1.0, 0.0], device=self.device)),
+            device=self.device,
+            dtype=self.defaults.dtype,
+        )
+        self.initial_high = torch.as_tensor(
+            self.cfg.params.get("initial_high", torch.tensor([1.0, 1.0, 0.0], device=self.device)),
+            device=self.device,
+            dtype=self.defaults.dtype,
+        )
+        self.step_size = torch.as_tensor(
+            self.cfg.params.get("step_size", (self.initial_low / 100.0)),
+            device=self.device,
+            dtype=self.defaults.dtype,
+        )
+        self.limit_low = torch.as_tensor(
+            self.cfg.params.get("limit_low", torch.tensor([0.8, 0.6, 0.0], device=self.device)),
+            device=self.device,
+            dtype=self.defaults.dtype,
+        )
+        self.limit_high = torch.as_tensor(
+            self.cfg.params.get("limit_high", torch.tensor([2.0, 1.6, 0.0], device=self.device)),
+            device=self.device,
+            dtype=self.defaults.dtype,
+        )
+        self.limits_set = True
+
+    def sample_values(self, env_ids: torch.Tensor) -> torch.Tensor:
+        env_ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
+        idx = torch.randint(0, self.num_buckets, (len(env_ids), self.total_num_shapes), device=self.device)
+
+        reset_modes = self.central_adr_manager.get_reset_instructions(env_ids).to(self.device)
+        is_bound_envs = torch.isin(reset_modes, self.mode_range)
+
+        low_diff = self.difficulties[0::2].clamp(0, self.max_difficulty).long()
+        high_diff = self.difficulties[1::2].clamp(0, self.max_difficulty).long()
+        low_idx = low_diff.unsqueeze(0).expand(len(env_ids), -1)
+        high_idx = high_diff.unsqueeze(0).expand(len(env_ids), -1)
+
+        if is_bound_envs.any():
+            param_idx = (reset_modes[is_bound_envs] - self.mode_offset).long()
+            physical_dim_idx = param_idx // 2
+            is_lower_bound = (param_idx % 2 == 0)
+            bound_rows = torch.nonzero(is_bound_envs).squeeze(-1)
+            idx[bound_rows[is_lower_bound], physical_dim_idx[is_lower_bound]] = 0
+            idx[bound_rows[~is_lower_bound], physical_dim_idx[~is_lower_bound]] = 1
+
+        sampled = self.material_buckets[low_idx, high_idx, idx]  # (n_envs, n_shapes, 3)
+        return sampled
+
+    def set_values(self, env_ids, values):
+        value_device = self.asset.root_physx_view.get_material_properties().device
+        env_ids_i32 = torch.as_tensor(env_ids, device=value_device, dtype=torch.int32)
+        self.asset.root_physx_view.set_material_properties(values.contiguous().to(value_device), indices=env_ids_i32)
+
+
+class RobotMaterialCSADR(MaterialPropertyADR):
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        assert isinstance(self.asset, Articulation)
+        if self.asset_cfg.body_ids != slice(None):
+            self.num_shapes_per_body = []
+            for link_path in self.asset.root_physx_view.link_paths[0]:
+                link_view = self.asset._physics_sim_view.create_rigid_body_view(link_path)
+                self.num_shapes_per_body.append(link_view.max_shapes)
+            if sum(self.num_shapes_per_body) != self.asset.root_physx_view.max_shapes:
+                raise ValueError("RobotMaterialCSADR failed to parse shape counts per body.")
+
+    def sample_values(self, env_ids: torch.Tensor) -> torch.Tensor:
+        values = super().sample_values(env_ids)
+        if self.num_shapes_per_body is None:
+            return values
+        current_materials = self.asset.root_physx_view.get_material_properties().to(values.device)
+        env_ids = torch.as_tensor(env_ids, device=values.device, dtype=torch.long)
+        out = current_materials[env_ids].clone()
+        for body_id in self.asset_cfg.body_ids:
+            start = sum(self.num_shapes_per_body[:body_id])
+            end = start + self.num_shapes_per_body[body_id]
+            out[:, start:end] = values[:, start:end]
+        return out
+
+
+class ObjectMaterialCSADR(MaterialPropertyADR):
+    def __init__(self, cfg, env):
+        self.asset_cfgs = cfg.params.get("asset_cfgs", None)
+        if self.asset_cfgs:
+            params = dict(cfg.params)
+            if params.get("asset_cfg", None) is None:
+                params["asset_cfg"] = self.asset_cfgs[0]
+            cfg.params = params
+        super().__init__(cfg, env)
+        assert isinstance(self.asset, RigidObject)
+        self._pool_asset_names: list[str] = []
+        self._pool_assets: list[RigidObject] = []
+        self._pool_randomizable_shape_masks: list[torch.Tensor] = []
+        self.randomizable_shape_mask = torch.zeros((self.num_envs, self.total_num_shapes), dtype=torch.bool, device=self.device)
+        self._refresh_pool_assets()
+
+    def _resolve_pool_names(self) -> list[str]:
+        if self.asset_cfgs:
+            return [asset_cfg.name for asset_cfg in self.asset_cfgs]
+        pool_names = getattr(self._env, "_object_scale_pool_names", None)
+        if pool_names:
+            return list(pool_names)
+        if self.asset_cfg is not None:
+            return [self.asset_cfg.name]
+        raise ValueError(f"{self.__class__.__name__} requires `asset_cfg` or non-empty `asset_cfgs`.")
+
+    def _set_defaults(self):
+        pool_names = self._resolve_pool_names()
+        first_name = pool_names[0]
+        first_asset = self._env.scene[first_name]
+        if not isinstance(first_asset, RigidObject):
+            raise TypeError(
+                f"{self.__class__.__name__} expected rigid object asset for '{first_name}', got {type(first_asset)}."
+            )
+
+        self.asset = first_asset
+        self.total_num_shapes = first_asset.root_physx_view.max_shapes
+
+        for name in pool_names[1:]:
+            asset = self._env.scene[name]
+            if not isinstance(asset, RigidObject):
+                raise TypeError(f"{self.__class__.__name__} expected rigid object asset for '{name}', got {type(asset)}.")
+            if asset.root_physx_view.max_shapes != self.total_num_shapes:
+                raise ValueError(
+                    f"{self.__class__.__name__} requires all pool assets to have the same number of shapes. "
+                    f"Expected {self.total_num_shapes}, got {asset.root_physx_view.max_shapes} for '{name}'."
+                )
+
+        all_materials = first_asset.root_physx_view.get_material_properties()[0]
+        if self.randomize_viscous:
+            self.defaults = all_materials.flatten().to(self.device).clone()
+        else:
+            self.defaults = all_materials[:, :2].flatten().to(self.device).clone()
+        self.param_shape = 2 * self.total_num_shapes
+
+    def _build_randomizable_shape_mask(self, asset: RigidObject) -> torch.Tensor:
+        initial_materials = asset.root_physx_view.get_material_properties()
+        initial_static_friction = initial_materials[:, :, 0]
+        return initial_static_friction > 1e-4
+
+    def _refresh_pool_assets(self) -> None:
+        pool_names = self._resolve_pool_names()
+
+        if pool_names == self._pool_asset_names and len(self._pool_assets) > 0:
+            return
+
+        pool_assets: list[RigidObject] = []
+        pool_masks: list[torch.Tensor] = []
+        for name in pool_names:
+            asset = self._env.scene[name]
+            if not isinstance(asset, RigidObject):
+                raise TypeError(f"{self.__class__.__name__} expected rigid object asset for '{name}', got {type(asset)}.")
+            if asset.root_physx_view.max_shapes != self.total_num_shapes:
+                raise ValueError(
+                    f"{self.__class__.__name__} requires all pool assets to have the same number of shapes. "
+                    f"Expected {self.total_num_shapes}, got {asset.root_physx_view.max_shapes} for '{name}'."
+                )
+            pool_assets.append(asset)
+            pool_masks.append(self._build_randomizable_shape_mask(asset))
+
+        self._pool_asset_names = pool_names
+        self._pool_assets = pool_assets
+        self._pool_randomizable_shape_masks = pool_masks
+        self.randomizable_shape_mask = pool_masks[0]
+
+    def _get_selected_asset_indices(self, env_ids: torch.Tensor) -> torch.Tensor:
+        self._refresh_pool_assets()
+        active_idx = getattr(self._env, "active_asset_indices", None)
+        if active_idx is None:
+            return torch.zeros(len(env_ids), dtype=torch.long, device=self.device)
+        selected = torch.as_tensor(active_idx, device=self.device, dtype=torch.long)[env_ids]
+        if len(self._pool_assets) > 0:
+            selected = selected.clamp(0, len(self._pool_assets) - 1)
+        return selected
+
+    def sample_values(self, env_ids: torch.Tensor) -> torch.Tensor:
+        """
+        since setting the materials doesn't support individual envs,
+        the function should return values for all envs,
+        but since if ever use those assets, they should be set anyway, this function would not preserve their values
+        """
+        values = super().sample_values(env_ids) #shape (len(env_ids), n_shapes, 3)
+        env_ids = torch.as_tensor(env_ids, device=values.device, dtype=torch.long)
+        if len(env_ids) == 0:
+            return values
+
+        selected_asset_indices = self._get_selected_asset_indices(env_ids)
+        output = torch.zeros(
+            (len(self._pool_assets), *self._pool_assets[0].root_physx_view.get_material_properties().shape),
+            device=self.device)
+        for asset_idx, asset in enumerate(self._pool_assets):
+            # local env_ids that has current asset active
+            row_ids = torch.nonzero(selected_asset_indices == asset_idx).squeeze(-1)
+            if len(row_ids) == 0:
+                continue
+            selected_env_ids = env_ids[row_ids]
+            current_materials = asset.root_physx_view.get_material_properties() # (n_envs, n_shapes, 3)
+            material_device = current_materials.device
+            selected_env_ids_local = selected_env_ids.to(device=material_device, dtype=torch.long)
+            # mask = self._pool_randomizable_shape_masks[asset_idx][selected_env_ids_local].unsqueeze(-1) # (len(env_ids))
+            # current = current_materials[selected_env_ids_local] #(len(env_ids), n_shapes, 3)
+            current_materials[selected_env_ids_local] = values[row_ids].to(material_device)
+            output[asset_idx] = current_materials
+            # output[row_ids] = torch.where(mask.to(values.device), output[row_ids], current.to(values.device))
+        return output #(n_active_assets, n_envs, n_shapes, 3)
+
+    def set_values(self, env_ids, values):
+        env_ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
+        if len(env_ids) == 0:
+            return
+
+        selected_asset_indices = self._get_selected_asset_indices(env_ids)
+        for asset_idx, asset in enumerate(self._pool_assets):
+            row_ids = torch.nonzero(selected_asset_indices == asset_idx).squeeze(-1)
+            if len(row_ids) == 0:
+                continue
+            # selected_env_ids = env_ids[row_ids]
+            # value_device = asset.root_physx_view.get_material_properties().device
+            # # env_ids_i32 = selected_env_ids.to(device=value_device, dtype=torch.int32)
+            # to_set_values = asset.root_physx_view.get_material_properties().clone()
+            # to_set_values[selected_env_ids] = values.to(value_device)
+            to_set_values = values[asset_idx]
+            asset.root_physx_view.set_material_properties(
+                to_set_values.contiguous().to('cpu'), indices=torch.arange(self.num_envs, device='cpu'))
+
+class RobotMassADR(RobotBodyCSADR):
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        self.recompute_inertia = bool(cfg.params.get("recompute_inertia", True))
+
+    def _set_defaults(self):
+        self.defaults = self.asset.data.default_mass[:, self.body_ids].clone()
+
+    def set_values(self, env_ids, values):
+        env_ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
+        body_ids = torch.as_tensor(self.body_ids, dtype=torch.int64, device=self.device)
+        masses = self.asset.root_physx_view.get_masses()
+        masses[env_ids[:, None], body_ids] = values
+        self.asset.root_physx_view.set_masses(masses, env_ids)
+
+        if not self.recompute_inertia:
+            return
+        ratios = masses[env_ids[:, None], body_ids] / self.asset.data.default_mass[env_ids[:, None], body_ids]
+        inertias = self.asset.root_physx_view.get_inertias()
+        if isinstance(self.asset, Articulation):
+            inertias[env_ids[:, None], body_ids] = self.asset.data.default_inertia[env_ids[:, None], body_ids] * ratios[..., None]
+        else:
+            inertias[env_ids] = self.asset.data.default_inertia[env_ids] * ratios
+        self.asset.root_physx_view.set_inertias(inertias, env_ids)
+
 
 class ObjectMassADR(ConsecutiveSuccessADR):
     def __init__(self, cfg, env):
         super().__init__(cfg, env)
-        self.recompute_inertia = cfg.params.get("recompute_inertia", True)
+        self.recompute_inertia = bool(cfg.params.get("recompute_inertia", True))
 
-    def reset(self, env_ids: Sequence[int] | None = None) -> None:
-        to_set_ids = self._manage_difficulty(env_ids)
-
-        if len(to_set_ids) == 0:
-            return
-
-        values = self._get_new_values(to_set_ids)
-        # self.asset.root_physx_view.set_masses(values, env_ids=to_set_ids)
-
-        # resolve body indices
+    def _set_defaults(self):
         if self.asset_cfg.body_ids == slice(None):
-            body_ids = torch.arange(self.asset.num_bodies, dtype=torch.int, device=self.defaults.device)
+            self._body_ids = torch.arange(self.asset.num_bodies, dtype=torch.long, device=self.device)
         else:
-            body_ids = torch.tensor(self.asset_cfg.body_ids, dtype=torch.int, device=self.defaults.device)
+            self._body_ids = torch.tensor(self.asset_cfg.body_ids, dtype=torch.long, device=self.device)
+        self.defaults = self.asset.data.default_mass[:, self._body_ids].clone()
 
-        # get the current masses of the bodies (num_assets, num_bodies)
+    def set_values(self, env_ids, values):
+        env_ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
         masses = self.asset.root_physx_view.get_masses()
+        masses[env_ids[:, None], self._body_ids] = values
+        self.asset.root_physx_view.set_masses(masses, env_ids)
 
-        masses[to_set_ids[:, None], body_ids] = values
-
-        # set the mass into the physics simulation
-        self.asset.root_physx_view.set_masses(masses, to_set_ids)
-
-        # recompute inertia tensors if needed
-        if self.recompute_inertia:
-            # compute the ratios of the new masses to the initial masses
-            ratios = masses[to_set_ids[:, None], body_ids] / self.asset.data.default_mass[to_set_ids[:, None], body_ids]
-            # scale the inertia tensors by the the ratios
-            # since mass randomization is done on default values, we can use the default inertia tensors
-            inertias = self.asset.root_physx_view.get_inertias()
-            if isinstance(self.asset, Articulation):
-                # inertia has shape: (num_envs, num_bodies, 9) for articulation
-                inertias[to_set_ids[:, None], body_ids] = (
-                    self.asset.data.default_inertia[to_set_ids[:, None], body_ids] * ratios[..., None]
-                )
-            else:
-                # inertia has shape: (num_envs, 9) for rigid object
-                inertias[to_set_ids] = self.asset.data.default_inertia[to_set_ids] * ratios
-            # set the inertia tensors into the physics simulation
-            self.asset.root_physx_view.set_inertias(inertias, to_set_ids)
-    
-    def _set_defaults(self):
-        self.defaults = self.asset.data.default_mass
-
-
-#TODO: think of better way of randomizing quaternion
-class ObjectScaleAndPosADR(ConsecutiveSuccessADR):
-    """
-    sets the position and quaternion of the object
-    if the object's difficulty doesn't match the current difficulty, it will be moved under the ground plane
-    and if it matches, the object will be moved to workspace
-    """
-    def __init__(self, cfg, env):
-        super().__init__(cfg, env)
-        self.pos_device = self.asset.data.root_pos_w.device
-        if len(self.asset_cfg.name.split("_")) == 2:
-            self.asset_difficulty = int(self.asset_cfg.name.split("_")[1])
+        if not self.recompute_inertia:
+            return
+        ratios = masses[env_ids[:, None], self._body_ids] / self.asset.data.default_mass[env_ids[:, None], self._body_ids]
+        inertias = self.asset.root_physx_view.get_inertias()
+        if isinstance(self.asset, Articulation):
+            inertias[env_ids[:, None], self._body_ids] = (
+                self.asset.data.default_inertia[env_ids[:, None], self._body_ids] * ratios[..., None]
+            )
         else:
-            self.asset_difficulty = 0
-
-        randomize_z = cfg.params.get("randomize_z", False)
-        if not randomize_z:
-            self.step_size[2] = 0
-
-        self.limit_low = torch.tensor((-1., -1., 0., -1., -1., -1., -1.), device=self.pos_device)
-        self.limit_high = torch.tensor((1., 1., 1.0,  1., 1., 1., 1.), device=self.pos_device)
+            inertias[env_ids] = self.asset.data.default_inertia[env_ids] * ratios
+        self.asset.root_physx_view.set_inertias(inertias, env_ids)
 
 
-    def reset(self, env_ids: Sequence[int] | None = None) -> None:
-        env_ids = env_ids.to(self.defaults.device)
-        self._manage_difficulty(env_ids)
+class ObsNoiseCSADR(ConsecutiveSuccessADR):
+    def _set_defaults(self):
+        self.obs_key = self.cfg.params.get("obs_key", None)
+        if self.obs_key is None:
+            raise ValueError("ObsNoiseCSADR requires `obs_key` in curriculum params.")
 
-        match_ids, not_match_ids = self._get_difficylty_matches_and_unmatches(env_ids, self.difficulties[env_ids])
+        obs_dim = self.cfg.params.get("obs_dim", None)
+        obs_shape = self.cfg.params.get("obs_shape", None)
+        self._shape_func = self.cfg.params.get("shape_func", None)
+        self._shape_func_params = self.cfg.params.get("shape_func_params", {})
+        if obs_dim is None and obs_shape is None and self._shape_func is None:
+            raise ValueError("ObsNoiseCSADR requires `obs_dim` / `obs_shape` or `shape_func` in curriculum params.")
+        if obs_dim is not None and obs_shape is not None:
+            raise ValueError("ObsNoiseCSADR expects only one of `obs_dim` or `obs_shape`.")
 
-        if len(not_match_ids) > 0 and (self.asset.data.root_pos_w[not_match_ids, 2] > -50.).any():
-            away_pos = self.defaults[not_match_ids]
-            away_pos[:, 2] = -100.
-            self.asset.write_root_pose_to_sim(away_pos, not_match_ids)
+        if obs_dim is None and obs_shape is not None:
+            if isinstance(obs_shape, int):
+                obs_dim = obs_shape
+            else:
+                obs_dim = 1
+                for dim in obs_shape:
+                    obs_dim *= int(dim)
 
-        # if len(to_set_ids) == 0:
-        #     return
+        self.obs_dim = int(obs_dim) if obs_dim is not None else 0
+        self._obs_buffer_attr = self.cfg.params.get("obs_buffer_attr", "obs_adr_buffers")
+        if not hasattr(self._env, self._obs_buffer_attr):
+            setattr(self._env, self._obs_buffer_attr, {})
 
-        if len(match_ids) > 0:
-            values = self._get_new_values(match_ids)
-            self.asset.write_root_pose_to_sim(values, match_ids)
-            self._env.active_asset_indices[match_ids] = self.asset_difficulty
+        if self.obs_dim > 0:
+            self.defaults = torch.zeros((self.num_envs, self.obs_dim), device=self.device)
+            buffers = getattr(self._env, self._obs_buffer_attr)
+            if self.obs_key not in buffers:
+                buffers[self.obs_key] = torch.zeros_like(self.defaults)
+        else:
+            self._defer_adr_init = True
+            self.defaults = torch.zeros((self.num_envs, 1), device=self.device)
+
+    def _resolve_feature_dim(self) -> int:
+        if self.obs_dim > 0:
+            return self.obs_dim
+        if self._shape_func is None:
+            raise ValueError("ObsNoiseCSADR could not infer observation dimension: `shape_func` missing.")
+        data = self._shape_func(self._env, **self._shape_func_params)
+        if not isinstance(data, torch.Tensor):
+            raise TypeError(f"ObsNoiseCSADR shape_func must return torch.Tensor. Got: {type(data)}.")
+        if data.shape[0] != self.num_envs:
+            raise ValueError(
+                f"ObsNoiseCSADR shape_func returned leading dim {data.shape[0]}, expected num_envs={self.num_envs}."
+            )
+        self.obs_dim = int(data.reshape(self.num_envs, -1).shape[1])
+        self.defaults = torch.zeros((self.num_envs, self.obs_dim), device=self.device, dtype=data.dtype)
+        buffers = getattr(self._env, self._obs_buffer_attr)
+        if self.obs_key not in buffers or buffers[self.obs_key].shape != (self.num_envs, self.obs_dim):
+            buffers[self.obs_key] = torch.zeros_like(self.defaults)
+        return self.obs_dim
+
+    def _set_limits_and_stepsize(self):
+        low_default = torch.zeros((self.num_envs, self.obs_dim), device=self.device, dtype=self.defaults.dtype)
+        high_default = low_default.clone()
+        step_default = torch.full((self.num_envs, self.obs_dim), 0.01, device=self.device, dtype=self.defaults.dtype)
+        limit_low_default = torch.full((self.num_envs, self.obs_dim), -1.0, device=self.device, dtype=self.defaults.dtype)
+        limit_high_default = torch.full((self.num_envs, self.obs_dim), 1.0, device=self.device, dtype=self.defaults.dtype)
+        self.initial_low = self._expand_param(self.cfg.params.get("initial_low", None), low_default)
+        self.initial_high = self._expand_param(self.cfg.params.get("initial_high", None), high_default)
+        self.step_size = self._expand_param(self.cfg.params.get("step_size", None), step_default)
+        self.limit_low = self._expand_param(self.cfg.params.get("limit_low", None), limit_low_default)
+        self.limit_high = self._expand_param(self.cfg.params.get("limit_high", None), limit_high_default)
+        self.limits_set = True
+
+    def set_values(self, env_ids, values):
+        buffers = getattr(self._env, self._obs_buffer_attr)
+        if self.obs_key not in buffers:
+            buffers[self.obs_key] = torch.zeros((self.num_envs, self.obs_dim), device=self.device, dtype=values.dtype)
+        buffer = buffers[self.obs_key]
+        buffer[env_ids] = values.to(buffer.device, dtype=buffer.dtype)
+
+
+class ActionNoiseCSADR(ConsecutiveSuccessADR):
+    def _set_defaults(self):
+        self.action_key = self.cfg.params.get("action_key", None)
+        if self.action_key is None:
+            raise ValueError("ActionNoiseCSADR requires `action_key` in curriculum params.")
+
+        action_dim = self.cfg.params.get("action_dim", None)
+        action_shape = self.cfg.params.get("action_shape", None)
+        self._shape_func = self.cfg.params.get("shape_func", None)
+        self._shape_func_params = self.cfg.params.get("shape_func_params", {})
+        if action_dim is None and action_shape is None and self._shape_func is None:
+            raise ValueError("ActionNoiseCSADR requires `action_dim` / `action_shape` or `shape_func` in curriculum params.")
+        if action_dim is not None and action_shape is not None:
+            raise ValueError("ActionNoiseCSADR expects only one of `action_dim` or `action_shape`.")
+
+        if action_dim is None and action_shape is not None:
+            if isinstance(action_shape, int):
+                action_dim = action_shape
+            else:
+                action_dim = 1
+                for dim in action_shape:
+                    action_dim *= int(dim)
+
+        self.action_dim = int(action_dim) if action_dim is not None else 0
+        self._action_buffer_attr = self.cfg.params.get("action_buffer_attr", "action_adr_buffers")
+        if not hasattr(self._env, self._action_buffer_attr):
+            setattr(self._env, self._action_buffer_attr, {})
+
+        if self.action_dim > 0:
+            self.defaults = torch.zeros((self.num_envs, self.action_dim), device=self.device)
+            buffers = getattr(self._env, self._action_buffer_attr)
+            if self.action_key not in buffers:
+                buffers[self.action_key] = torch.zeros_like(self.defaults)
+        else:
+            self._defer_adr_init = True
+            self.defaults = torch.zeros((self.num_envs, 1), device=self.device)
+
+    def _resolve_feature_dim(self) -> int:
+        if self.action_dim > 0:
+            return self.action_dim
+        if self._shape_func is None:
+            raise ValueError("ActionNoiseCSADR could not infer action dimension: `shape_func` missing.")
+        data = self._shape_func(self._env, **self._shape_func_params)
+        if not isinstance(data, torch.Tensor):
+            raise TypeError(f"ActionNoiseCSADR shape_func must return torch.Tensor. Got: {type(data)}.")
+        if data.shape[0] != self.num_envs:
+            raise ValueError(
+                f"ActionNoiseCSADR shape_func returned leading dim {data.shape[0]}, expected num_envs={self.num_envs}."
+            )
+        self.action_dim = int(data.reshape(self.num_envs, -1).shape[1])
+        self.defaults = torch.zeros((self.num_envs, self.action_dim), device=self.device, dtype=data.dtype)
+        buffers = getattr(self._env, self._action_buffer_attr)
+        if self.action_key not in buffers or buffers[self.action_key].shape != (self.num_envs, self.action_dim):
+            buffers[self.action_key] = torch.zeros_like(self.defaults)
+        return self.action_dim
+
+    def _set_limits_and_stepsize(self):
+        low_default = torch.zeros((self.num_envs, self.action_dim), device=self.device, dtype=self.defaults.dtype)
+        high_default = low_default.clone()
+        step_default = torch.full((self.num_envs, self.action_dim), 0.01, device=self.device, dtype=self.defaults.dtype)
+        limit_low_default = torch.full((self.num_envs, self.action_dim), -1.0, device=self.device, dtype=self.defaults.dtype)
+        limit_high_default = torch.full((self.num_envs, self.action_dim), 1.0, device=self.device, dtype=self.defaults.dtype)
+        self.initial_low = self._expand_param(self.cfg.params.get("initial_low", None), low_default)
+        self.initial_high = self._expand_param(self.cfg.params.get("initial_high", None), high_default)
+        self.step_size = self._expand_param(self.cfg.params.get("step_size", None), step_default)
+        self.limit_low = self._expand_param(self.cfg.params.get("limit_low", None), limit_low_default)
+        self.limit_high = self._expand_param(self.cfg.params.get("limit_high", None), limit_high_default)
+        self.limits_set = True
+
+    def set_values(self, env_ids, values):
+        buffers = getattr(self._env, self._action_buffer_attr)
+        if self.action_key not in buffers:
+            buffers[self.action_key] = torch.zeros((self.num_envs, self.action_dim), device=self.device, dtype=values.dtype)
+        buffer = buffers[self.action_key]
+        buffer[env_ids] = values.to(buffer.device, dtype=buffer.dtype)
+
+class ObjectPoolScaleAndPosADR(ConsecutiveSuccessADR):
+    """Pool-aware object pose + size ADR with per-dimension low/high difficulty.
+
+    Expected asset naming:
+    - ``object`` for difficulty 0
+    - ``obj_<m|p><abs_diff>_<idx>`` for nonzero difficulty
+    Example: ``obj_m5_0`` means size difficulty 5 on the "smaller" side.
+
+    ADR feature dimensions are ordered as: ``[x, y, z, size]`` and each feature has
+    separate low/high difficulty (8 total ADR modes). Size is sampled from existing
+    signed levels inside the current interval ``[min_diff, max_diff]``.
+    """
+
+    _OBJECT_NAME_PATTERN = re.compile(r"^obj_([mp])(\d+)_(\d+)$")
+
+    def __init__(self, cfg, env):
+        self.asset_cfgs = cfg.params.get("asset_cfgs", None)
+        if not self.asset_cfgs:
+            raise ValueError(f"{self.__class__.__name__} requires non-empty `asset_cfgs`.")
+        self.asset_names = [asset_cfg.name for asset_cfg in self.asset_cfgs]
+
+        parsed_levels = []
+        for name in self.asset_names:
+            if name == "object":
+                parsed_levels.append(0)
+            else:
+                match = self._OBJECT_NAME_PATTERN.match(name)
+                if match is None:
+                    raise ValueError(
+                        f"{self.__class__.__name__} expected asset name 'object' or pattern "
+                        f"'obj_<m|p><abs_diff>_<idx>'. Got: '{name}'."
+                    )
+                sign_token = match.group(1)
+                abs_diff = int(match.group(2))
+                signed_diff = -abs_diff if sign_token == "m" else abs_diff
+                parsed_levels.append(signed_diff)
+        self._asset_levels_from_name = parsed_levels
+        level_set = set(parsed_levels)
+        abs_levels = sorted({abs(level) for level in level_set if level != 0})
+        missing_pairs = [level for level in abs_levels if (-level not in level_set or level not in level_set)]
+        if len(missing_pairs) > 0:
+            raise ValueError(
+                f"{self.__class__.__name__} requires both 'small' (-k) and 'large' (+k) assets "
+                f"for each absolute difficulty. Missing pairs for: {missing_pairs}."
+            )
+
+        self._min_pool_level = int(min(parsed_levels))
+        self._max_pool_level = int(max(parsed_levels))
+
+        params = dict(cfg.params)
+        if params.get("asset_cfg", None) is None:
+            params["asset_cfg"] = self.asset_cfgs[0]
+        cfg.params = params
+
+        self.inactive_height = float(cfg.params.get("inactive_height", -100.0))
+        self.randomize_quat = bool(cfg.params.get("randomize_quat", False))
+        self.randomize_z = bool(cfg.params.get("randomize_z", False))
+
+        self.assets: list[RigidObject] = []
+        self.pool_levels = torch.zeros(0, dtype=torch.long, device=env.device)
+        self.level_to_asset_indices: dict[int, torch.Tensor] = {}
+        self._available_levels = torch.zeros(0, dtype=torch.long, device=env.device)
+
+        super().__init__(cfg, env)
+
+        if not hasattr(self._env, "active_asset_indices"):
+            self._env.active_asset_indices = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        if not hasattr(self._env, "_object_pool_target_pose"):
+            self._env._object_pool_target_pose = torch.zeros((self.num_envs, 7), device=self.device)
 
     def _set_defaults(self):
-        # self.defaults = self.asset.data.cfg.spawn.scale
-        self.defaults = torch.concat((self.asset.data.root_pos_w, self.asset.data.root_quat_w), dim=-1)
-        # if (self.defaults[:, 2] < -50.).any():
-        #     self.defaults[:, 2] = self.workspace_pos[-1]
+        self.assets = [self._env.scene[name] for name in self.asset_names]
+        self.pool_levels = torch.tensor(self._asset_levels_from_name, dtype=torch.long, device=self.device)
 
-    def _get_new_values(self, env_ids):
-        values = super()._get_new_values(env_ids)
+        self.level_to_asset_indices = {}
+        for level_t in torch.unique(self.pool_levels):
+            level = int(level_t.item())
+            indices = torch.nonzero(self.pool_levels == level_t).squeeze(-1)
+            self.level_to_asset_indices[level] = indices
+        self._available_levels = torch.tensor(sorted(self.level_to_asset_indices.keys()), dtype=torch.long, device=self.device)
 
-        # normalize the quaternions
-        quats = values[:, 3:]
-        values[:, 3:] = quats / quats.sum(dim=-1, keepdim=True)
+        # Compatibility attributes used by existing wrappers/debug flows.
+        self._env._object_scale_pool_names = list(self.asset_names)
+        self._env._object_scale_pool_difficulties = self.pool_levels
+        xform_scales = []
+        for name in self.asset_names:
+            view = XformPrimView(self._env.scene[name].cfg.prim_path, device=self.device, validate_xform_ops=False)
+            xform_scales.append(view.get_scales()[0].to(self.device))
+        self._env._object_scale_pool_scales = torch.stack(xform_scales, dim=0)
 
+        default_pos = self.assets[0].data.root_pos_w.clone()
+        default_size = torch.zeros((self.num_envs, 1), device=self.device, dtype=default_pos.dtype)
+        self.defaults = torch.cat((default_pos, default_size), dim=-1)
+
+    def _set_limits_and_stepsize(self):
+        step_default = torch.zeros_like(self.defaults)
+        step_default[:, 0] = 0.01
+        step_default[:, 1] = 0.01
+        step_default[:, 2] = 0.01 if self.randomize_z else 0.0
+        step_default[:, 3] = 1.0
+
+        limit_low_default = self.defaults.clone()
+        limit_high_default = self.defaults.clone()
+        limit_low_default[:, 0] = -1.0
+        limit_low_default[:, 1] = -1.0
+        limit_low_default[:, 2] = 0.0
+        limit_high_default[:, 0] = 1.0
+        limit_high_default[:, 1] = 1.0
+        limit_high_default[:, 2] = 1.0
+        limit_low_default[:, 3] = float(self._min_pool_level)
+        limit_high_default[:, 3] = float(self._max_pool_level)
+
+        initial_low_default = self.defaults.clone()
+        initial_high_default = self.defaults.clone()
+
+        self.initial_low = self._expand_param(self.cfg.params.get("initial_low", None), initial_low_default)
+        self.initial_high = self._expand_param(self.cfg.params.get("initial_high", None), initial_high_default)
+        self.step_size = self._expand_param(self.cfg.params.get("step_size", None), step_default)
+        self.limit_low = self._expand_param(self.cfg.params.get("limit_low", None), limit_low_default)
+        self.limit_high = self._expand_param(self.cfg.params.get("limit_high", None), limit_high_default)
+
+        # Keep z fixed when requested, regardless of custom step config.
+        if not self.randomize_z:
+            self.step_size[:, 2] = 0.0
+
+        self.limits_set = True
+
+    def _sample_size_levels(
+        self,
+        env_ids: torch.Tensor,
+        low: torch.Tensor,
+        high: torch.Tensor,
+        reset_modes: torch.Tensor,
+    ) -> torch.Tensor:
+        size_low = torch.ceil(low[:, 3]).long()
+        size_high = torch.floor(high[:, 3]).long()
+        size_low = torch.clamp(size_low, min=self._min_pool_level, max=self._max_pool_level)
+        size_high = torch.clamp(size_high, min=self._min_pool_level, max=self._max_pool_level)
+
+        invalid = size_low > size_high
+        if invalid.any():
+            fallback = torch.clamp(
+                torch.round((low[:, 3] + high[:, 3]) * 0.5).long(),
+                min=self._min_pool_level,
+                max=self._max_pool_level,
+            )
+            size_low[invalid] = fallback[invalid]
+            size_high[invalid] = fallback[invalid]
+
+        levels = self._available_levels.unsqueeze(0)
+        candidate_mask = (levels >= size_low.unsqueeze(1)) & (levels <= size_high.unsqueeze(1))
+        has_candidates = candidate_mask.any(dim=1)
+        sampled = torch.zeros(len(env_ids), device=self.device, dtype=torch.long)
+
+        if has_candidates.any():
+            sampled[has_candidates] = self._sample_levels_from_mask(candidate_mask[has_candidates])
+        if (~has_candidates).any():
+            sampled[~has_candidates] = self._sample_nearest_levels(
+                size_low[~has_candidates], size_high[~has_candidates]
+            )
+
+        is_bound_envs = torch.isin(reset_modes, self.mode_range)
+        if is_bound_envs.any():
+            bound_rows = torch.nonzero(is_bound_envs).squeeze(-1)
+            param_idx = (reset_modes[bound_rows] - self.mode_offset).long()
+            physical_dim_idx = param_idx // 2
+            is_lower_bound = (param_idx % 2) == 0
+            size_rows_mask = physical_dim_idx == 3 #check if the the mode is scale
+            if size_rows_mask.any():
+                size_rows = bound_rows[size_rows_mask]
+                size_is_lower = is_lower_bound[size_rows_mask]
+                size_low_rows = size_low[size_rows]
+                size_high_rows = size_high[size_rows]
+                row_levels = self._available_levels.unsqueeze(0)
+                row_candidate_mask = (row_levels >= size_low_rows.unsqueeze(1)) & (row_levels <= size_high_rows.unsqueeze(1))
+                row_has_candidates = row_candidate_mask.any(dim=1)
+
+                if row_has_candidates.any():
+                    valid_mask = row_candidate_mask[row_has_candidates]
+                    level_grid = self._available_levels.unsqueeze(0).expand(valid_mask.shape[0], -1)
+                    i64max = torch.iinfo(torch.long).max
+                    i64min = torch.iinfo(torch.long).min
+                    lower_choices = torch.where(valid_mask, level_grid, torch.full_like(level_grid, i64max)).min(dim=1).values
+                    upper_choices = torch.where(valid_mask, level_grid, torch.full_like(level_grid, i64min)).max(dim=1).values
+                    valid_rows = size_rows[row_has_candidates]
+                    valid_is_lower = size_is_lower[row_has_candidates]
+                    if valid_is_lower.any():
+                        sampled[valid_rows[valid_is_lower]] = lower_choices[valid_is_lower]
+                    if (~valid_is_lower).any():
+                        sampled[valid_rows[~valid_is_lower]] = upper_choices[~valid_is_lower]
+
+                if (~row_has_candidates).any():
+                    fallback_rows = size_rows[~row_has_candidates]
+                    fallback_levels = self._sample_nearest_levels(size_low[fallback_rows], size_high[fallback_rows])
+                    sampled[fallback_rows] = fallback_levels
+
+        return sampled
+
+    def _sample_levels_from_mask(self, mask: torch.Tensor) -> torch.Tensor:
+        """Uniformly sample one available level per row from boolean mask."""
+        # mask: (rows, n_levels)
+        counts = mask.sum(dim=1)
+        if (counts <= 0).any():
+            raise ValueError(f"{self.__class__.__name__} got empty candidate rows in _sample_levels_from_mask.")
+        rand_rank = torch.floor(torch.rand(mask.shape[0], device=self.device) * counts.to(torch.float32)).long()
+        ranks = torch.cumsum(mask.to(torch.long), dim=1) - 1
+        chosen_mask = mask & (ranks == rand_rank.unsqueeze(1))
+        level_grid = self._available_levels.unsqueeze(0).expand(mask.shape[0], -1)
+        return (chosen_mask.to(torch.long) * level_grid).sum(dim=1).long()
+
+    def _sample_nearest_levels(self, size_low: torch.Tensor, size_high: torch.Tensor) -> torch.Tensor:
+        """Sample nearest existing levels to interval midpoint (random tie-break)."""
+        mid = (size_low.to(torch.float32) + size_high.to(torch.float32)) * 0.5
+        level_grid = self._available_levels.to(torch.float32).unsqueeze(0).expand(len(mid), -1)
+        diff = torch.abs(level_grid - mid.unsqueeze(1))
+        min_diff = diff.min(dim=1).values
+        nearest_mask = diff == min_diff.unsqueeze(1)
+        return self._sample_levels_from_mask(nearest_mask)
+
+    def _snap_levels_to_available(self, levels: torch.Tensor) -> torch.Tensor:
+        levels = levels.clone()
+        is_valid = torch.isin(levels, self._available_levels)
+        if is_valid.all():
+            return levels
+        missing_rows = torch.nonzero(~is_valid).squeeze(-1)
+        levels[missing_rows] = self._sample_nearest_levels(levels[missing_rows], levels[missing_rows])
+        return levels
+
+    def _sample_asset_indices_for_levels(self, sampled_levels: torch.Tensor) -> torch.Tensor:
+        selected_indices = torch.zeros_like(sampled_levels, dtype=torch.long, device=self.device)
+        unique_levels = torch.unique(sampled_levels)
+        for level_t in unique_levels:
+            level = int(level_t.item())
+            candidates = self.level_to_asset_indices[level]
+            level_rows = torch.nonzero(sampled_levels == level_t).squeeze(-1)
+            choose_ids = torch.randint(0, candidates.numel(), (len(level_rows),), device=self.device)
+            selected_indices[level_rows] = candidates[choose_ids]
+        return selected_indices
+
+    def sample_values(self, env_ids: torch.Tensor) -> torch.Tensor:
+        self._ensure_initialized()
+        env_ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
+        if len(env_ids) == 0:
+            return torch.zeros((0, 4), device=self.device, dtype=self.defaults.dtype)
+
+        reset_modes = self.central_adr_manager.get_reset_instructions(env_ids).to(self.device)
+
+        low_diff = self.difficulties[0::2]
+        high_diff = self.difficulties[1::2]
+        low = self.initial_low[env_ids] - (low_diff[None] * self.step_size[env_ids])
+        low = torch.clamp(low, min=self.limit_low[env_ids], max=self.limit_high[env_ids])
+        high = self.initial_high[env_ids] + (high_diff[None] * self.step_size[env_ids])
+        high = torch.clamp(high, min=self.limit_low[env_ids], max=self.limit_high[env_ids])
+
+        values = torch.rand_like(high) * (high - low) + low
+
+        # Enforce exact ADR boundary values for xyz dimensions.
+        is_bound_envs = torch.isin(reset_modes, self.mode_range)
+        if is_bound_envs.any():
+            bound_rows = torch.nonzero(is_bound_envs).squeeze(-1)
+            param_idx = (reset_modes[bound_rows] - self.mode_offset).long()
+            physical_dim_idx = param_idx // 2
+            is_lower_bound = (param_idx % 2) == 0
+            is_pos_dim = physical_dim_idx < 3
+            if is_pos_dim.any():
+                pos_rows = bound_rows[is_pos_dim]
+                pos_dims = physical_dim_idx[is_pos_dim]
+                pos_is_lower = is_lower_bound[is_pos_dim]
+                low_rows = pos_rows[pos_is_lower]
+                high_rows = pos_rows[~pos_is_lower]
+                low_dims = pos_dims[pos_is_lower]
+                high_dims = pos_dims[~pos_is_lower]
+                if len(low_rows) > 0:
+                    values[low_rows, low_dims] = low[low_rows, low_dims]
+                if len(high_rows) > 0:
+                    values[high_rows, high_dims] = high[high_rows, high_dims]
+
+        sampled_levels = self._sample_size_levels(env_ids=env_ids, low=low, high=high, reset_modes=reset_modes)
+        values[:, 3] = sampled_levels.to(values.dtype)
         return values
 
-    def _get_difficylty_matches_and_unmatches(self, env_ids, difficulties):
-        difficulty_matches = difficulties[env_ids] == self.asset_difficulty
-        match_ids = env_ids[difficulty_matches]
-        not_match_ids = env_ids[~difficulty_matches]
-        return match_ids, not_match_ids
+    def set_values(self, env_ids, values):
+        env_ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
+        if len(env_ids) == 0:
+            return
 
-    def maybe_get_asset(self):
-        match_ids, not_match_ids = self._get_difficylty_matches_and_unmatches(self.difficulties, torch.range(self.num_envs))
-        if len(match_ids) > 0:
-            return self.asset, match_ids
-        return None, None
+        sampled_levels = torch.round(values[:, 3]).long()
+        sampled_levels = torch.clamp(sampled_levels, min=self._min_pool_level, max=self._max_pool_level)
+        sampled_levels = self._snap_levels_to_available(sampled_levels)
+        selected_asset_indices = self._sample_asset_indices_for_levels(sampled_levels)
+        self._env.active_asset_indices[env_ids] = selected_asset_indices
+
+        if self.randomize_quat:
+            quat = math_utils.random_orientation(len(env_ids), self.device)
+        else:
+            quat = self.assets[0].data.root_quat_w[env_ids].clone()
+        target_pose = torch.cat((values[:, :3], quat), dim=-1)
+        self._env._object_pool_target_pose[env_ids] = target_pose
 
 
+        active_mask = []
+        for asset_idx, asset in enumerate(self.assets):
+            matches = selected_asset_indices == asset_idx
+            match_ids = env_ids[matches]
+            not_match_ids = env_ids[~matches]
 
-def active_pool_wrapper(mdp_func, asset_names: list[str]):
+            if len(not_match_ids) > 0 and (asset.data.root_pos_w[not_match_ids, 2] > -50.0).any():
+                away_pose = torch.cat(
+                    (asset.data.root_pos_w[not_match_ids].clone(), asset.data.root_quat_w[not_match_ids].clone()),
+                    dim=-1,
+                )
+                away_pose[:, 2] = self.inactive_height
+                asset.write_root_pose_to_sim(away_pose, not_match_ids)
+
+            if len(match_ids) > 0:
+                asset.write_root_pose_to_sim(target_pose[matches], match_ids)
+        
+            active_mask.append((self._env.scene[self.asset_names[asset_idx]].data.root_pos_w[:, 2] > -50.0))
+
+        #check if every reset envs have exactly one active object
+        active_count = torch.stack(active_mask).sum(dim=0)
+        assert bool((active_count == 1).all().item()), (
+            "active_pool_wrapper expected exactly one active object per env, "
+            f"but got counts in [{int(active_count.min().item())}, {int(active_count.max().item())}]."
+        )
+        
+
+
+class ActionReplayCSADR(mdp.EMAJointPositionToLimitsAction, ConsecutiveSuccessADR):
     """
-    Wraps a standard Isaac Lab mdp observation function.
+    ADR term that stores the last action taken by the agent and replays it with some probability.
+    separate probability for every store histroy action
+    increasing the difficulty should increase the probability for earlier actions 
     """
 
-    # 1. REMOVED **kwargs: We strictly only ask for 'env' now.
-    # Isaac Lab's config parser will be perfectly happy with this.
-    def wrapped_obs_func(env: ManagerBasedRLEnv) -> torch.Tensor:
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        self.max_replay_history = cfg.params.get("max_replay_history", 5)
+        # 0 = Oldest, N-1 = Newest 
+        self.histroy_action_buffer = torch.zeros((self.max_replay_history, self.num_envs, self.action_dim), device=self.device)
+        self.sharpness = cfg.params.get('sharpness', 0.1)
+        self.step_size = torch.full_like(self.defaults, 0.01)
+
+    def _set_defaults(self):
+        """
+        difficulty for probability of sampling from different steps
+        the difficulty for probability works like a slop
+        """
+        self.defaults = torch.zeros((self.num_envs, 1), device=self.device)
+
+
+    def process_actions(self, actions):
+        super().process_actions(actions)
+        
+        assert self.histroy_action_buffer.shape[1:] == self.processed_actions.shape
+
+        # update the histroy buffer
+        self.histroy_action_buffer = self.histroy_action_buffer.roll(shifts=-1, dims=0)
+        self.histroy_action_buffer[-1] = self._processed_actions[:]
+
+        # sample delayed actions
+        self.processed_actions[:] = self.get_delayed_actions()
+
+        self._prev_applied_actions[:] = self._processed_actions[:]
+
+    def reset(self, env_ids = None):
+        return super().reset(env_ids)
+    
+    def change_property(self, env_ids, values):
+        pass
+
+    def get_delayed_actions(self):
+        # (n_envs, 1)
+        values = self._get_new_values(torch.arange(self.num_envs, device=self.device))
+        # (1, max_replay_history)
+        indices = torch.arange(self.max_replay_history, dtype=torch.float32, device=self.device).unsqueeze(0)
+        
+        centers = ((1.0 - values) * (self.max_replay_history - 1))
+    
+        # 2. Calculate negative squared distance from the center. Shape: [num_envs, buffer_size]
+        distances_sq = -torch.pow(indices - centers, 2)
+        
+        # 3. Scale by temperature and apply softmax
+        scores = distances_sq / self.sharpness
+
+        # Convert scores to probabilities. Shape: [num_envs, buffer_size]
+        probabilities = F.softmax(scores, dim=1)
+        delay_action_idx = torch.multinomial(probabilities, num_samples=1)
+        delayed_actions = self.histroy_action_buffer[delay_action_idx]
+
+        return delayed_actions
+    
+    def _set_limits_and_stepsize(self):
+        if self.defaults is not None:
+            self.initial_low = self.cfg.params.get("initial_low", self.defaults)
+            self.initial_low = self.initial_low.to(self.defaults.device)
+
+            self.initial_high = self.cfg.params.get("initial_high", self.defaults)
+            self.initial_high = self.initial_high.to(self.defaults.device)
+
+            self.step_size = self.cfg.params.get("step_size", torch.full_like(self.defaults, 0.01))  # Amount to widen range by
+            if isinstance(self.step_size, (int, float)):
+                self.step_size = torch.full_like(self.defaults, self.step_size)
+            self.step_size = self.step_size.to(self.defaults.device)
+
+            self.limit_low = self.cfg.params.get("limit_low", torch.full_like(self.defaults, 0.))
+            self.limit_low = self.limit_low.to(self.defaults.device)
+
+            self.limit_high = self.cfg.params.get("limit_high", torch.full_like(self.defaults, 1.))  # Hard max limit
+            self.limit_high = self.limit_high.to(self.defaults.device)
+
+            self.limits_set = True
+            
+
+# def active_pool_wrapper(mdp_fn, asset_names: list[str], **kwargs):
+#     def wrapped_obs_func(env: ManagerBasedRLEnv) -> torch.Tensor:
+#         all_results = []
+#         active_mask = torch.zeros((env.num_envs, len(asset_names)), dtype=torch.bool, device=env.device)
+#         for name in asset_names:
+#             temp_cfg = SceneEntityCfg(name)
+#             data = mdp_fn(env, asset_cfg=temp_cfg, **kwargs)
+#             all_results.append(data)
+#         for idx, name in enumerate(asset_names):
+#             # Pool policy parks inactive objects underground. Verify one active object per env.
+#             active_mask[:, idx] = env.scene[name].data.root_pos_w[:, 2] > -50.0
+
+#         active_count = active_mask.sum(dim=1)
+#         assert bool((active_count == 1).all().item()), (
+#             "active_pool_wrapper expected exactly one active object per env, "
+#             f"but got counts in [{int(active_count.min().item())}, {int(active_count.max().item())}]."
+#         )
+
+#         stacked_data = torch.stack(all_results, dim=1)
+#         active_idx = getattr(env, "active_asset_indices", None)
+#         if active_idx is None:
+#             active_idx = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+#         batch_idx = torch.arange(env.num_envs, device=env.device)
+
+#         return stacked_data[batch_idx, active_idx]
+
+#     return wrapped_obs_func
+
+def active_pool_wrapper(env, mdp_func, asset_names: list[str], fn_params):
+        assert len(fn_params) == len(asset_names), 'len of names and len of fns does not match'
+
         all_results = []
-
-        for name in asset_names:
-            temp_cfg = SceneEntityCfg(name)
-
-            # 2. Call the standard mdp function directly with just what it needs
-            data = mdp_func(env, asset_cfg=temp_cfg)
+        for i, name in enumerate(asset_names):
+            # temp_cfg = SceneEntityCfg(name)
+            if fn_params is None:
+                fn_param = {}
+            else:
+                fn_param = fn_params[i]
+            data = mdp_func(env, **fn_param)
             all_results.append(data)
 
         stacked_data = torch.stack(all_results, dim=1)
-
-        # 3. Read the state saved by our Event Term
         active_idx = getattr(env, "active_asset_indices", None)
-
+        # will not be available for the first reset
         if active_idx is None:
             active_idx = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
         batch_idx = torch.arange(env.num_envs, device=env.device)
 
-        return stacked_data[batch_idx, active_idx]
+        obs = stacked_data[batch_idx, active_idx]
 
-    return wrapped_obs_func
+        return obs
+
+def obs_adr_wrapper(env, mdp_func, obs_key: str, operation: str = "add", obs_buffer_attr: str = "obs_adr_buffers", fn_params=None):
+    """Wraps an observation function and applies ADR perturbation parameters from env buffers."""
+
+    if operation not in {"add", "scale", "abs"}:
+        raise ValueError(f"Unsupported obs_adr operation '{operation}'. Use one of: add, scale, abs.")
+
+    data = mdp_func(env, **(fn_params or {}))
+
+    buffer_dict = getattr(env, obs_buffer_attr, None)
+    if not isinstance(buffer_dict, dict):
+        return data
+
+    noise = buffer_dict.get(obs_key, None)
+    if noise is None:
+        return data
+
+    data_flat = data.reshape(env.num_envs, -1)
+    noise = noise.to(data.device, dtype=data.dtype)
+    noise_flat = noise.reshape(env.num_envs, -1)
+
+    if noise_flat.shape[1] == 1 and data_flat.shape[1] != 1:
+        noise_flat = noise_flat.repeat(1, data_flat.shape[1])
+
+    if noise_flat.shape != data_flat.shape:
+        raise ValueError(
+            f"Obs ADR shape mismatch for key '{obs_key}': data {tuple(data_flat.shape)} vs noise {tuple(noise_flat.shape)}."
+        )
+
+    if operation == "add":
+        data_flat = data_flat + noise_flat
+    elif operation == "scale":
+        data_flat = data_flat * noise_flat
+    else:
+        data_flat = noise_flat
+
+    return data_flat.reshape_as(data)
+
+# def obs_adr_wrapper(mdp_func, obs_key: str, operation: str = "add", obs_buffer_attr: str = "obs_adr_buffers", **kwargs):
+#     if operation not in {"add", "scale", "abs"}:
+#         raise ValueError(f"Unsupported obs_adr operation '{operation}'. Use one of: add, scale, abs.")
+
+#     def wrapped_obs_func(env: ManagerBasedRLEnv) -> torch.Tensor:
+#         data = mdp_func(env, **kwargs)
+#         buffer_dict = getattr(env, obs_buffer_attr, None)
+#         if not isinstance(buffer_dict, dict):
+#             return data
+
+#         noise = buffer_dict.get(obs_key, None)
+#         if noise is None:
+#             return data
+
+#         data_flat = data.reshape(env.num_envs, -1)
+#         noise = noise.to(data.device, dtype=data.dtype)
+#         noise_flat = noise.reshape(env.num_envs, -1)
+
+#         if noise_flat.shape[1] == 1 and data_flat.shape[1] != 1:
+#             noise_flat = noise_flat.repeat(1, data_flat.shape[1])
+#         if noise_flat.shape != data_flat.shape:
+#             raise ValueError(
+#                 f"Obs ADR shape mismatch for key '{obs_key}': data {tuple(data_flat.shape)} vs noise {tuple(noise_flat.shape)}."
+#             )
+
+#         if operation == "add":
+#             data_flat = data_flat + noise_flat
+#         elif operation == "scale":
+#             data_flat = data_flat * noise_flat
+#         else:
+#             data_flat = noise_flat
+
+#         return data_flat.reshape_as(data)
+
+#     return wrapped_obs_func
